@@ -1,0 +1,13 @@
+# Core dependency: local speech-to-text.
+# faster-whisper bundles CTranslate2 and pulls in ffmpeg-based decoding via PyAV.
+faster-whisper>=1.0.0
+
+# --- No other runtime dependencies ---
+# NVIDIA NIM is called over plain HTTPS with the standard library (urllib), and
+# the .env loader is built in, so nothing else is required to run the pipeline.
+
+# Optional, only if you want real speaker diarization instead of the heuristic:
+#   pip install "pyannote.audio>=3.1"
+
+# Development / tests
+pytest>=7.4
