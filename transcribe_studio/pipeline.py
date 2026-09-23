@@ -25,7 +25,7 @@ from . import diarize as diarize_mod
 from . import extractive as extractive_mod
 from . import subtitles as subs_mod
 from . import summarize as summarize_mod
-from .config import MEDIA_EXTENSIONS, TranscriptResult, save_json
+from .config import MEDIA_EXTENSIONS, TranscriptResult, load_json, save_json
 from .nim import MissingApiKey, NimClient, NimError
 from .transcribe import DEFAULT_CHUNK_OVERLAP, segments_to_paragraphs, transcribe
 
@@ -117,7 +117,7 @@ def run(
     nim_client: Optional[NimClient] = None,
     progress: Optional[ProgressFn] = None,
 ) -> PipelineResult:
-    """Process one media file into ``out_dir``.
+    """Process one media file (or a saved ``transcript.json``) into ``out_dir``.
 
     ``model`` (a preloaded WhisperModel) and ``nim_client`` can be supplied to
     reuse resources across a batch. When ``nim_client`` is ``None`` it is created
@@ -133,18 +133,22 @@ def run(
     if nim_client is None:
         nim_client = _maybe_nim(options, result.warnings)
 
-    # 1. Transcribe (local, always).
-    transcript: TranscriptResult = transcribe(
-        media_path,
-        model_size=options.model_size,
-        language=options.language,
-        device=options.device,
-        compute_type=options.compute_type,
-        chunk_length=options.chunk_length,
-        chunk_overlap=options.chunk_overlap,
-        model=model,
-        progress=progress,
-    )
+    # 1. Transcribe locally, or reuse a saved transcript.json (no Whisper at all).
+    transcript: TranscriptResult
+    if Path(media_path).suffix.lower() == ".json":
+        transcript = load_json(media_path)
+    else:
+        transcript = transcribe(
+            media_path,
+            model_size=options.model_size,
+            language=options.language,
+            device=options.device,
+            compute_type=options.compute_type,
+            chunk_length=options.chunk_length,
+            chunk_overlap=options.chunk_overlap,
+            model=model,
+            progress=progress,
+        )
     result.language = transcript.language
     result.duration = transcript.duration
 

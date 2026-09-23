@@ -21,6 +21,7 @@ htmlcov/
 
 # transcribe-studio output
 results/
+demo*/
 out/
 *.srt.tmp
 

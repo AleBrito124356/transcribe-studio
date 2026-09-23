@@ -41,3 +41,6 @@ packages = ["transcribe_studio"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+    "slow: real ffmpeg, subprocess, socket or wheel-build work (deselect with -m 'not slow')",
+]

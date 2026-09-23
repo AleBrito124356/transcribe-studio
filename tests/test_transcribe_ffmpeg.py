@@ -23,10 +23,15 @@ from transcribe_studio.transcribe import (
     transcribe,
 )
 
-needs_ffmpeg = pytest.mark.skipif(
+_ffmpeg_missing = pytest.mark.skipif(
     shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
     reason="ffmpeg/ffprobe not installed",
 )
+
+
+def needs_ffmpeg(test):
+    """Real ffmpeg work: skipped without ffmpeg, and marked slow."""
+    return pytest.mark.slow(_ffmpeg_missing(test))
 
 
 def _ffmpeg(*args):
@@ -45,9 +50,15 @@ class FakeWhisper:
         self.calls = []
 
     def transcribe(self, audio_path, language=None, **kwargs):
-        with wave.open(audio_path) as w:
-            duration = w.getnframes() / w.getframerate()
-            fmt = (w.getnchannels(), w.getframerate())
+        try:
+            with wave.open(audio_path) as w:
+                duration = w.getnframes() / w.getframerate()
+                fmt = (w.getnchannels(), w.getframerate())
+        except wave.Error:
+            # Non-WAV input handed straight to the model (as faster-whisper allows).
+            from transcribe_studio.transcribe import probe_duration
+
+            duration, fmt = probe_duration(audio_path), ("original", "original")
         self.calls.append({"duration": round(duration, 2), "language": language, "format": fmt})
         segments = []
         t = 0.0

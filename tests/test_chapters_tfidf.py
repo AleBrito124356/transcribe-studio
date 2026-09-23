@@ -166,8 +166,9 @@ def test_five_thousand_segments_in_under_two_seconds():
         words = " ".join(rng.choice(vocab[topic: topic + 200]) for _ in range(12))
         segments.append(Segment(start=t, end=t + 3.5, text=words))
         t += 4.0
-    began = time.perf_counter()
+    # CPU time of this process, so a busy machine does not make the test flaky.
+    began = time.process_time()
     chapters = detect_chapters_local(segments)
-    elapsed = time.perf_counter() - began
+    elapsed = time.process_time() - began
     assert elapsed < 2.0, f"took {elapsed:.2f}s"
     assert 3 <= len(chapters) <= 15

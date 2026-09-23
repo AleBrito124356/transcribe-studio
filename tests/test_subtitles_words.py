@@ -329,3 +329,11 @@ def test_write_captions_writes_both_formats_and_reports(tmp_path):
     assert report.cues == 2 and report.ok
     assert len(parse_srt_strict((tmp_path / "c.srt").read_text(encoding="utf-8"))) == 2
     assert len(parse_vtt_strict((tmp_path / "c.vtt").read_text(encoding="utf-8"))) == 2
+
+
+def test_line_breaks_prefer_sentence_boundaries_over_balance():
+    assert balance_lines("Thanks, Leo. I want to start with a confession:", 42) == [
+        "Thanks, Leo.", "I want to start with a confession:"]
+    # never split an infinitive just to balance ("want / to start")
+    lines = balance_lines("We really want to start the migration on Monday morning", 42)
+    assert not lines[0].endswith(" want")

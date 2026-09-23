@@ -80,6 +80,8 @@ actually literally honestly totally absolutely obviously definitely probably pre
 lot lots bit mean means know knew guess guys guy thanks thank hey hello hi welcome today anyway
 cool awesome great good nice fine alright bye look listen talk talking said saying tell told stuff
 first second third next last new old big small little
+two three four five six seven eight nine ten eleven twelve twenty hundred thousand
+show episode everybody everyone folks
 """
 _STOPWORDS_ES = """
 a al algo alguien algun alguna algunas alguno algunos ante antes aqui asi aun aunque bajo bien cada casi
@@ -96,6 +98,8 @@ _FILLERS_ES = """
 bueno pues vale oye mira claro osea digamos tipo verdad eh este ahi aca hola gracias bienvenidos
 bienvenidas hoy cosa cosas manera forma parte hablar hablamos dicho decir dice digo creo vez veces
 primero segundo tercero siguiente ultimo nuevo nueva gran grande pequeno bien mal igual
+uno dos tres cuatro cinco seis siete ocho nueve diez once doce veinte cien mil
+programa episodio seccion
 """
 _STOPWORDS = frozenset(fold(w) for w in (_STOPWORDS_EN + _FILLERS_EN + _STOPWORDS_ES + _FILLERS_ES).split())
 

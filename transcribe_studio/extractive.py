@@ -54,7 +54,8 @@ _ACTION_PATTERNS = [
     r"\b(?:we|i|you|they)\s+(?:should|must|ought to)\b",
     r"\blet'?s\b",
     r"\b(?:i'll|i will|we'll|we will|i'm going to|we're going to|i am going to|we are going to)\b",
-    r"\b(?:make sure|don'?t forget|remember to|follow up|action items?|to-?do|next steps?)\b",
+    # "to-do" needs its hyphen: a bare "todo" is Spanish for "everything".
+    r"\b(?:make sure|don'?t forget|remember to|follow up|action items?|to-do|next steps?)\b",
     r"\bhay que\b",
     r"\b(?:tenemos|tengo|tienes|tienen|hay) que\b",
     r"\bvamos a\b",

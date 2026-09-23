@@ -209,6 +209,7 @@ def test_network_errors_are_retried_with_backoff(monkeypatch):
     assert "3 attempts" in str(info.value)
 
 
+@pytest.mark.slow
 def test_real_closed_port_gives_one_line_error():
     port = _closed_port()
     client = NimClient(api_key="k", base_url=f"http://127.0.0.1:{port}/v1", max_retries=0, timeout=5)

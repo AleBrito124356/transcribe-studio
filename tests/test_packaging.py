@@ -25,6 +25,7 @@ def test_version_is_consistent():
     assert f'version = "{transcribe_studio.__version__}"' in pyproject
 
 
+@pytest.mark.slow
 def test_wheel_contains_only_the_namespaced_package(tmp_path):
     pytest.importorskip("setuptools", minversion="77")
     # Build from a copy: setuptools writes build/ and *.egg-info next to the

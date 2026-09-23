@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """transcribe-studio command-line interface.
 
-Subcommands:
+Subcommands (every one except `transcribe` also accepts a saved transcript.json,
+which skips Whisper entirely):
     transcribe   media -> transcript.txt (+ transcript.json)
     subs         media -> captions.srt / captions.vtt (+ optional translation)
     summarize    media, .txt or transcript.json -> summary.md (NIM, or offline extractive)
@@ -23,7 +24,7 @@ from . import chapters as chapters_mod
 from . import extractive as extractive_mod
 from . import subtitles as subs_mod
 from . import summarize as summarize_mod
-from .config import load_env, load_json, save_json
+from .config import InvalidTranscript, load_env, load_json, save_json
 from .diarize import PYANNOTE_NOTE, assign_speakers, to_dialogue
 from .nim import MissingApiKey, NimClient, NimError
 from .pipeline import DIARIZATION_HEURISTIC, PipelineOptions, is_up_to_date, run, run_batch
@@ -45,6 +46,8 @@ EXIT_NOT_FOUND = 4
 EXIT_NIM = 5           # NIM rejected the key, rate limited us, or was unreachable
 EXIT_WHISPER = 6       # faster-whisper missing, or the model could not be loaded
 EXIT_MEDIA = 7         # ffmpeg could not decode the input
+EXIT_BAD_INPUT = 8     # a .json that is not a transcript this tool can read
+EXIT_USAGE = 2         # an input the command cannot use (same code argparse uses)
 EXIT_INTERRUPTED = 130
 
 
@@ -135,32 +138,33 @@ def _require_nim(model: str | None):
         raise SystemExit(EXIT_NO_KEY)
 
 
-def _load_segments_for_summary(source: str, args):
-    """Return (full_text, language). Accepts a .txt, a .json transcript, or media."""
-    path = Path(source)
-    if path.suffix.lower() == ".txt":
-        return path.read_text(encoding="utf-8"), (args.lang or "auto")
-    if path.suffix.lower() == ".json":
-        tr = load_json(path)
-        return tr.text, tr.language
-    tr = transcribe(source, **_transcribe_kwargs(args))
-    return tr.text, tr.language
+class UsageError(Exception):
+    """A command was given an input it cannot work with."""
 
 
-def _load_segments_for_chapters(source: str, args):
-    """Return (segments, duration) from a transcript.json or media."""
-    path = Path(source)
-    if path.suffix.lower() == ".json":
-        tr = load_json(path)
-    else:
-        tr = transcribe(source, **_transcribe_kwargs(args))
-    return tr.segments, tr.duration
+def _is_transcript(source: str) -> bool:
+    return Path(source).suffix.lower() == ".json"
+
+
+def _load_transcript(source: str, args):
+    """A saved transcript.json (no Whisper, no model download) or media (transcribed now)."""
+    if _is_transcript(source):
+        path = Path(source)
+        if not path.is_file():
+            raise FileNotFoundError(f"Transcript not found: {source}")
+        return load_json(path)
+    return transcribe(source, **_transcribe_kwargs(args))
 
 
 # ---------------------------------------------------------------------------
 # Command handlers
 # ---------------------------------------------------------------------------
 def cmd_transcribe(args) -> int:
+    if _is_transcript(args.media):
+        raise UsageError(
+            f"transcribe needs audio or video; {Path(args.media).name} is already a transcript. "
+            "Give it to subs, summarize, chapters or all instead."
+        )
     tr = transcribe(args.media, **_transcribe_kwargs(args))
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -181,7 +185,7 @@ def cmd_transcribe(args) -> int:
 
 
 def cmd_subs(args) -> int:
-    tr = transcribe(args.media, **_transcribe_kwargs(args))
+    tr = _load_transcript(args.media, args)
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     segments = tr.segments
@@ -212,14 +216,20 @@ def cmd_summarize(args) -> int:
     if offline and not args.local:
         print("note: NVIDIA_API_KEY not set; writing an offline extractive summary "
               "(use --local to choose this explicitly).", file=sys.stderr)
-    text, language = _load_segments_for_summary(args.source, args)
+    if Path(args.source).suffix.lower() == ".txt":
+        text = Path(args.source).read_text(encoding="utf-8")
+        language, nim_text = (args.lang or "auto"), text
+    else:
+        tr = _load_transcript(args.source, args)
+        text, language = tr.text, tr.language
+        nim_text = to_dialogue(tr.segments) if tr.has_speakers else text
     if offline:
         summary = extractive_mod.summarize_extractive(text)
     else:
         client = _require_nim(args.model_nim)
         lang_phrase = summarize_mod.resolve_language(args.summary_lang, language)
         try:
-            summary = summarize_mod.summarize_transcript(text, client, language=lang_phrase)
+            summary = summarize_mod.summarize_transcript(nim_text, client, language=lang_phrase)
         except NimError as exc:
             raise NimError(f"{exc} Use --local for an offline extractive summary.",
                            status=exc.status, fatal=exc.fatal) from None
@@ -233,7 +243,8 @@ def cmd_summarize(args) -> int:
 
 
 def cmd_chapters(args) -> int:
-    segments, duration = _load_segments_for_chapters(args.source, args)
+    tr = _load_transcript(args.source, args)
+    segments, duration = tr.segments, tr.duration
     client = None
     if not args.local and NimClient.available():
         client = _require_nim(args.model_nim)
@@ -270,6 +281,11 @@ def cmd_all(args) -> int:
     # reported on stderr while the run waits out a rate limit.
     client = _nim_client() if (options.use_nim and NimClient.available()) else None
     source = Path(args.source)
+    if source.suffix.lower() == ".txt":
+        raise UsageError(
+            "all needs audio/video or a transcript.json; a .txt has no timestamps for "
+            "subtitles or chapters. Use `summarize` for plain text."
+        )
     if source.is_dir():
         results = run_batch(
             str(source), args.out, options, nim_client=client,
@@ -316,8 +332,8 @@ def build_parser(prog: str = "transcribe-studio") -> argparse.ArgumentParser:
     p_t.set_defaults(func=cmd_transcribe)
 
     # subs
-    p_s = sub.add_parser("subs", help="Generate SRT and VTT subtitles.")
-    p_s.add_argument("media")
+    p_s = sub.add_parser("subs", help="Generate SRT and VTT subtitles (media or transcript.json).")
+    p_s.add_argument("media", help="Media file, or a transcript.json to skip Whisper.")
     p_s.add_argument("-o", "--out", default="results")
     p_s.add_argument("--translate", default=None, help="Also write a translated track (e.g. --translate es).")
     p_s.add_argument("--max-chars", type=int, default=subs_mod.DEFAULT_MAX_CHARS, help="Max characters per subtitle line.")
@@ -329,7 +345,7 @@ def build_parser(prog: str = "transcribe-studio") -> argparse.ArgumentParser:
 
     # summarize
     p_sum = sub.add_parser("summarize", help="Summarize media, a .txt, or a .json transcript (NIM or offline).")
-    p_sum.add_argument("source")
+    p_sum.add_argument("source", help="Media file, a transcript.json, or a plain .txt.")
     p_sum.add_argument("-o", "--out", default="results")
     p_sum.add_argument("--summary-lang", default="auto", help="Summary language: auto|en|es|... (default: auto).")
     p_sum.add_argument("--local", action="store_true",
@@ -341,7 +357,7 @@ def build_parser(prog: str = "transcribe-studio") -> argparse.ArgumentParser:
 
     # chapters
     p_c = sub.add_parser("chapters", help="Generate YouTube-style chapters.")
-    p_c.add_argument("source", help="Media file or a transcript.json.")
+    p_c.add_argument("source", help="Media file, or a transcript.json to skip Whisper.")
     p_c.add_argument("-o", "--out", default="results")
     p_c.add_argument("--local", action="store_true", help="Force the offline heuristic (no NIM).")
     p_c.add_argument("--model-nim", default=None, help="Override NIM model.")
@@ -350,7 +366,8 @@ def build_parser(prog: str = "transcribe-studio") -> argparse.ArgumentParser:
 
     # all
     p_a = sub.add_parser("all", help="Full pipeline. Pass a directory for batch mode.")
-    p_a.add_argument("source", help="Media file or a directory of media files.")
+    p_a.add_argument("source", help="Media file, a transcript.json (regenerates every artifact "
+                                    "without Whisper), or a directory of media files.")
     p_a.add_argument("-o", "--out", default="results")
     p_a.add_argument("--translate", default=None, help="Add a translated subtitle track (e.g. es).")
     p_a.add_argument("--summary-lang", default="auto")
@@ -402,6 +419,10 @@ def _explain(exc: Exception) -> tuple:
         return EXIT_WHISPER, f"error: {exc}"
     if isinstance(exc, MediaDecodeError):
         return EXIT_MEDIA, f"error: {exc}"
+    if isinstance(exc, InvalidTranscript):
+        return EXIT_BAD_INPUT, f"error: {exc}"
+    if isinstance(exc, UsageError):
+        return EXIT_USAGE, f"error: {exc}"
     return EXIT_PARTIAL, (
         f"error: unexpected {type(exc).__name__}: {exc}\n"
         "Re-run with --debug (before the command name) to see the traceback."

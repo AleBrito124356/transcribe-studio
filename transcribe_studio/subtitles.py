@@ -43,8 +43,10 @@ _CLAUSE_END = re.compile(r"[,;:，、；：—–][\"'»”’)\]]*$")
 
 # Line-break etiquette (EN/ES): break *before* these words...
 _BREAK_BEFORE = frozenset(
-    "and but or so because that which who when while if to of in on at for with from "
-    "y e pero o u que porque cuando si de en con para por sin".split()
+    "and but or so because that which who when while if of in on at for with from "
+    "before after until unless since than although though whereas where "
+    "y e pero o u que porque cuando si de en con para por sin "
+    "antes despues después hasta mientras aunque donde como".split()
 )
 # ...and never leave these dangling at the end of a line.
 _NO_BREAK_AFTER = frozenset(
@@ -130,15 +132,20 @@ def balance_lines(text: str, max_chars: int = DEFAULT_MAX_CHARS) -> List[str]:
         top, bottom = " ".join(words[:i]), " ".join(words[i:])
         if len(top) > max_chars or len(bottom) > max_chars:
             continue
-        cost = abs(len(top) - len(bottom))
-        if _SENTENCE_END.search(words[i - 1]) or _CLAUSE_END.search(words[i - 1]):
-            cost -= 8  # a break after punctuation reads more naturally
+        # Priorities, as in broadcast style guides: sentence boundary, then
+        # clause boundary, then syntax (before a conjunction/preposition, never
+        # after an article), then balance, then a bottom-heavy shape.
+        cost = abs(len(top) - len(bottom)) / max_chars
+        if _SENTENCE_END.search(words[i - 1]):
+            cost -= 1.0  # "Thanks, Leo. / I want to start..."
+        elif _CLAUSE_END.search(words[i - 1]):
+            cost -= 0.6
         if _bare(words[i]) in _BREAK_BEFORE:
-            cost -= 5  # "...tested it / and the restore..."
+            cost -= 0.3  # "...tested it / and the restore..."
         if _bare(words[i - 1]) in _NO_BREAK_AFTER:
-            cost += 5  # never leave "the", "and", "de"... dangling at a line end
+            cost += 0.5  # never leave "the", "and", "de"... dangling at a line end
         if len(top) > len(bottom):
-            cost += 1  # prefer the bottom-heavy pyramid on ties
+            cost += 0.05  # prefer the bottom-heavy pyramid on near-ties
         candidate = (cost, -i, [top, bottom])
         if best is None or candidate[:2] < best[:2]:
             best = candidate

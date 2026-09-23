@@ -133,7 +133,12 @@ def test_long_transcripts_use_the_linear_scorer_quickly():
     text = " ".join(
         "Sentence " + " ".join(rng.choice(vocab) for _ in range(14)) + "." for _ in range(3000)
     )
-    began = time.perf_counter()
+    began = time.process_time()  # CPU time: robust on a busy machine
     summary = summarize_extractive(text)
-    assert time.perf_counter() - began < 3.0
+    assert time.process_time() - began < 3.0
     assert summary["tldr"] and 2 <= len(split_sentences(summary["summary"])) <= 5
+
+
+def test_spanish_todo_is_not_a_to_do_item():
+    assert not is_action_item("Eso es todo por hoy en Build Notes.")
+    assert is_action_item("Add the to-do list to the wiki.")
