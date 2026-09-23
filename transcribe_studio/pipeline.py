@@ -54,6 +54,9 @@ class PipelineOptions:
     use_nim: bool = True
     max_chars: int = subs_mod.DEFAULT_MAX_CHARS
     save_json_transcript: bool = True
+    # Tag captions with speakers ([Speaker 1] in SRT, <v Speaker 1> in VTT).
+    # Uses the transcript's speakers, or the pause heuristic when it has none.
+    speaker_labels: bool = False
 
 
 @dataclass
@@ -72,6 +75,8 @@ class PipelineResult:
     nim_fatal: bool = False
     # True when --skip-existing found finished outputs and nothing was redone.
     skipped: bool = False
+    # Lint of the written captions (overlaps, reading speed, line width).
+    caption_report: Optional[subs_mod.CaptionReport] = None
 
 
 def _maybe_nim(options: PipelineOptions, warnings: List[str]) -> Optional[NimClient]:
@@ -137,27 +142,25 @@ def run(
     result.language = transcript.language
     result.duration = transcript.duration
 
-    segments = transcript.segments
-    diarized_segments = None
-    if options.diarize:
-        diarized_segments = diarize_mod.assign_speakers(
-            segments, gap_threshold=options.diarize_gap
-        )
+    if options.diarize or (options.speaker_labels and not transcript.has_speakers):
+        if not options.diarize:
+            result.warnings.append(
+                "Speaker labels requested but the transcript has none: used the pause "
+                "heuristic (approximate; see --diarize in the README)."
+            )
+        labelled = diarize_mod.assign_speakers(transcript.segments, gap_threshold=options.diarize_gap)
         # Keep the labels in transcript.json too, so anything rebuilt from it
         # later (subs, summaries, chapters) still knows who spoke.
-        transcript = replace(
-            transcript, segments=diarized_segments, diarization=DIARIZATION_HEURISTIC
-        )
+        transcript = replace(transcript, segments=labelled, diarization=DIARIZATION_HEURISTIC)
+    segments = transcript.segments
 
     # 2. Transcript text.
     if options.make_transcript:
         transcript_file = out_path / "transcript.txt"
-        if diarized_segments is not None:
-            body = (
-                diarize_mod.PYANNOTE_NOTE
-                + "\n\n"
-                + diarize_mod.to_dialogue(diarized_segments)
-            )
+        if transcript.has_speakers:
+            body = diarize_mod.to_dialogue(segments)
+            if transcript.diarization == DIARIZATION_HEURISTIC:
+                body = diarize_mod.PYANNOTE_NOTE + "\n\n" + body
         else:
             body = segments_to_paragraphs(segments)
         transcript_file.write_text(body.strip() + "\n", encoding="utf-8")
@@ -172,8 +175,8 @@ def run(
     if options.make_subtitles:
         srt_file = out_path / "captions.srt"
         vtt_file = out_path / "captions.vtt"
-        subs_mod.write_srt(segments, srt_file, max_chars=options.max_chars)
-        subs_mod.write_vtt(segments, vtt_file, max_chars=options.max_chars)
+        caption_kwargs = {"max_chars": options.max_chars, "speaker_labels": options.speaker_labels}
+        result.caption_report = subs_mod.write_captions(segments, srt_file, vtt_file, **caption_kwargs)
         result.outputs.extend([str(srt_file), str(vtt_file)])
 
         # 3b. Translated subtitle track (needs NIM).
@@ -193,8 +196,7 @@ def run(
                 else:
                     t_srt = out_path / f"captions.{options.translate}.srt"
                     t_vtt = out_path / f"captions.{options.translate}.vtt"
-                    subs_mod.write_srt(translated, t_srt, max_chars=options.max_chars)
-                    subs_mod.write_vtt(translated, t_vtt, max_chars=options.max_chars)
+                    subs_mod.write_captions(translated, t_srt, t_vtt, **caption_kwargs)
                     result.outputs.extend([str(t_srt), str(t_vtt)])
 
     # 4. Summary (needs NIM).
@@ -259,6 +261,7 @@ def write_manifest(result: PipelineResult, options: PipelineOptions) -> Path:
         "duration": round(result.duration, 3),
         "outputs": [Path(o).name for o in result.outputs],
         "warnings": [w.strip().splitlines()[0] for w in result.warnings if w.strip()],
+        "captions": result.caption_report.summary() if result.caption_report else None,
         "options": asdict(options),
     }
     path = Path(result.output_dir) / MANIFEST_NAME
@@ -418,6 +421,8 @@ def _write_batch_report(out_dir: str, results: List[PipelineResult]) -> None:
             lines.append(f"- language: {r.language}")
             lines.append(f"- duration: {r.duration:.1f}s")
             lines.append(f"- outputs: {len(r.outputs)} file(s) in `{r.output_dir}`")
+            if r.caption_report is not None:
+                lines.append(f"- captions: {r.caption_report.summary()}")
         else:
             lines.append(f"- error: {r.error}")
         for w in r.warnings:

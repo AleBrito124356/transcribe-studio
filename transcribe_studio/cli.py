@@ -181,18 +181,24 @@ def cmd_subs(args) -> int:
     tr = transcribe(args.media, **_transcribe_kwargs(args))
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    subs_mod.write_srt(tr.segments, out_dir / "captions.srt", max_chars=args.max_chars)
-    subs_mod.write_vtt(tr.segments, out_dir / "captions.vtt", max_chars=args.max_chars)
+    segments = tr.segments
+    if args.speaker_labels and not tr.has_speakers:
+        print("note: the transcript has no speakers; using the pause heuristic for labels.",
+              file=sys.stderr)
+        segments = assign_speakers(segments)
+    caption_kwargs = {"max_chars": args.max_chars, "speaker_labels": args.speaker_labels}
+    report = subs_mod.write_captions(segments, out_dir / "captions.srt", out_dir / "captions.vtt",
+                                     **caption_kwargs)
     print(f"Wrote {out_dir / 'captions.srt'}")
     print(f"Wrote {out_dir / 'captions.vtt'}")
+    print(f"Captions: {report.summary()}")
 
     if args.translate:
         client = _require_nim(args.model_nim)
-        translated = subs_mod.translate_segments(tr.segments, args.translate, client)
+        translated = subs_mod.translate_segments(segments, args.translate, client)
         t_srt = out_dir / f"captions.{args.translate}.srt"
         t_vtt = out_dir / f"captions.{args.translate}.vtt"
-        subs_mod.write_srt(translated, t_srt, max_chars=args.max_chars)
-        subs_mod.write_vtt(translated, t_vtt, max_chars=args.max_chars)
+        subs_mod.write_captions(translated, t_srt, t_vtt, **caption_kwargs)
         print(f"Wrote {t_srt}")
         print(f"Wrote {t_vtt}")
     return 0
@@ -243,6 +249,7 @@ def cmd_all(args) -> int:
         summary_language=args.summary_lang,
         use_nim=not args.no_nim,
         max_chars=args.max_chars,
+        speaker_labels=args.speaker_labels,
     )
     # Build the NIM client here (not inside the pipeline) so retries are
     # reported on stderr while the run waits out a rate limit.
@@ -267,6 +274,8 @@ def cmd_all(args) -> int:
     print(f"Language: {result.language}  |  Duration: {result.duration:.1f}s")
     for out in result.outputs:
         print(f"Wrote {out}")
+    if result.caption_report is not None:
+        print(f"Captions: {result.caption_report.summary()}")
     return 0
 
 
@@ -298,6 +307,8 @@ def build_parser(prog: str = "transcribe-studio") -> argparse.ArgumentParser:
     p_s.add_argument("--translate", default=None, help="Also write a translated track (e.g. --translate es).")
     p_s.add_argument("--max-chars", type=int, default=subs_mod.DEFAULT_MAX_CHARS, help="Max characters per subtitle line.")
     p_s.add_argument("--model-nim", default=None, help="Override NIM model for translation.")
+    p_s.add_argument("--speaker-labels", action="store_true",
+                     help="[Speaker N] at each turn in SRT and <v Speaker N> voice tags in VTT.")
     _add_common_transcribe_args(p_s)
     p_s.set_defaults(func=cmd_subs)
 
@@ -331,6 +342,8 @@ def build_parser(prog: str = "transcribe-studio") -> argparse.ArgumentParser:
                      help="Skip inputs whose output folder already holds a finished run "
                           "(manifest.json with the same file name and size). Use it to resume a batch.")
     p_a.add_argument("--max-chars", type=int, default=subs_mod.DEFAULT_MAX_CHARS)
+    p_a.add_argument("--speaker-labels", action="store_true",
+                     help="Tag captions with speakers (implies the pause heuristic if none are known).")
     _add_common_transcribe_args(p_a)
     p_a.set_defaults(func=cmd_all)
 

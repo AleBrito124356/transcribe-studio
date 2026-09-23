@@ -318,3 +318,29 @@ def test_chunk_options_reach_the_transcriber(tmp_path, monkeypatch):
     run("fake_media.mp3", str(tmp_path / "o"),
         PipelineOptions(chunk_length=600, chunk_overlap=4, use_nim=False, make_summary=False))
     assert seen["chunk_length"] == 600 and seen["chunk_overlap"] == 4
+
+
+def test_speaker_labels_reach_the_captions(tmp_path):
+    out = tmp_path / "out"
+    result = run("fake_media.mp3", str(out),
+                 PipelineOptions(speaker_labels=True, diarize_gap=0.3, use_nim=False, make_summary=False))
+    vtt = (out / "captions.vtt").read_text(encoding="utf-8")
+    srt = (out / "captions.srt").read_text(encoding="utf-8")
+    assert "<v Speaker 1>" in vtt and "<v Speaker 2>" in vtt
+    assert "[Speaker 1] Welcome" in srt and "[Speaker 2] Then" in srt
+    assert any("pause heuristic" in w for w in result.warnings)
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["captions"].startswith("3 cues | 0 overlaps")
+
+
+def test_caption_report_is_returned_and_in_the_batch_report(tmp_path, monkeypatch):
+    result = run("fake_media.mp3", str(tmp_path / "one"), PipelineOptions(use_nim=False))
+    assert result.caption_report is not None and result.caption_report.ok
+    assert result.caption_report.cues == 3
+
+    media_dir = tmp_path / "d"
+    media_dir.mkdir()
+    (media_dir / "a.mp3").write_bytes(b"x")
+    monkeypatch.setattr(transcribe_mod, "_load_model", lambda *a, **k: object())
+    run_batch(str(media_dir), str(tmp_path / "out"), PipelineOptions(use_nim=False))
+    assert "- captions: 3 cues | 0 overlaps" in (tmp_path / "out" / "batch_report.md").read_text(encoding="utf-8")
