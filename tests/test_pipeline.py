@@ -219,3 +219,102 @@ def test_batch_stops_using_nim_after_a_fatal_error(tmp_path, monkeypatch):
     assert results[0].nim_fatal
     assert any("NIM disabled for the rest of the batch" in w for w in results[1].warnings)
     assert any("NIM disabled for the rest of the batch" in w for w in results[2].warnings)
+
+
+def test_same_stem_inputs_get_separate_folders(tmp_path, monkeypatch):
+    media_dir = tmp_path / "d"
+    media_dir.mkdir()
+    (media_dir / "ep01.mp3").write_bytes(b"x")
+    (media_dir / "ep01.wav").write_bytes(b"xy")
+    monkeypatch.setattr(transcribe_mod, "_load_model", lambda *a, **k: object())
+    results = run_batch(str(media_dir), str(tmp_path / "out"), PipelineOptions(use_nim=False))
+    folders = sorted(Path(r.output_dir).name for r in results)
+    assert folders == ["ep01", "ep01-wav"]
+    for folder in folders:
+        assert (tmp_path / "out" / folder / "transcript.txt").exists()
+    assert sorted(p.name for p in (tmp_path / "out").iterdir()) == ["batch_report.md", "ep01", "ep01-wav"]
+
+
+def test_batch_output_names_are_unique_and_deterministic():
+    from transcribe_studio.pipeline import batch_output_names
+
+    files = [Path(n) for n in sorted(["ep01-wav.mp3", "ep01.mp3", "ep01.wav", "EP01.MP4", "talk.m4a"])]
+    names = batch_output_names(files)
+    assert len(set(n.lower() for n in names.values())) == len(files)
+    assert names[Path("talk.m4a")] == "talk"
+    # The first file (in sorted order) with a stem keeps the bare stem.
+    assert names[Path("EP01.MP4")] == "EP01"
+    assert names[Path("ep01.mp3")] == "ep01-mp3"
+    assert names[Path("ep01-wav.mp3")] == "ep01-wav"
+    assert names[Path("ep01.wav")] == "ep01-wav-2"  # collides with the real stem above
+    assert batch_output_names(files) == names
+
+
+def test_skip_existing_resumes_a_batch(tmp_path, monkeypatch):
+    media_dir = tmp_path / "d"
+    media_dir.mkdir()
+    for name in ("a.mp3", "b.mp3"):
+        (media_dir / name).write_bytes(b"audio")
+    loads, calls = [], []
+    monkeypatch.setattr(transcribe_mod, "_load_model", lambda *a, **k: loads.append(1) or object())
+
+    def counting(media_path, *a, **k):
+        calls.append(Path(media_path).name)
+        return _fake_transcript()
+
+    monkeypatch.setattr(pipeline_mod, "transcribe", counting)
+    out = tmp_path / "out"
+    opts = PipelineOptions(use_nim=False)
+    first = run_batch(str(media_dir), str(out), opts)
+    assert calls == ["a.mp3", "b.mp3"] and not any(r.skipped for r in first)
+
+    # Re-run: everything is up to date, so neither Whisper nor transcribe run.
+    loads.clear(), calls.clear()
+    second = run_batch(str(media_dir), str(out), opts, skip_existing=True)
+    assert [r.skipped for r in second] == [True, True]
+    assert calls == [] and loads == []
+    assert "2 already up to date" in (out / "batch_report.md").read_text(encoding="utf-8")
+
+    # A changed input and a half-written folder are both redone.
+    (media_dir / "a.mp3").write_bytes(b"a different recording")
+    (out / "b" / "captions.srt").unlink()
+    third = run_batch(str(media_dir), str(out), opts, skip_existing=True)
+    assert calls == ["a.mp3", "b.mp3"]
+    assert [r.skipped for r in third] == [False, False]
+
+
+def test_manifest_records_the_run(tmp_path):
+    out = tmp_path / "out"
+    media = tmp_path / "show.mp3"
+    media.write_bytes(b"12345")
+    result = run(str(media), str(out), PipelineOptions(use_nim=False, make_summary=False))
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["source"] == {"name": "show.mp3", "size": 5}
+    assert manifest["outputs"] == [Path(o).name for o in result.outputs]
+    assert manifest["options"]["use_nim"] is False
+    assert manifest["language"] == "en"
+
+
+def test_diarized_speakers_are_saved_in_transcript_json(tmp_path):
+    out = tmp_path / "out"
+    run("fake_media.mp3", str(out),
+        PipelineOptions(diarize=True, diarize_gap=0.3, use_nim=False, make_summary=False))
+    data = json.loads((out / "transcript.json").read_text(encoding="utf-8"))
+    speakers = [s["speaker"] for s in data["segments"]]
+    assert all(speakers), speakers
+    assert speakers == ["Speaker 1", "Speaker 1", "Speaker 2"]  # 0.5s gap before seg 3 > 0.3
+    assert data["diarization"] == "pause-heuristic"
+    assert "Speaker 2:" in (out / "transcript.txt").read_text(encoding="utf-8")
+
+
+def test_chunk_options_reach_the_transcriber(tmp_path, monkeypatch):
+    seen = {}
+
+    def spy(media_path, **kwargs):
+        seen.update(kwargs)
+        return _fake_transcript()
+
+    monkeypatch.setattr(pipeline_mod, "transcribe", spy)
+    run("fake_media.mp3", str(tmp_path / "o"),
+        PipelineOptions(chunk_length=600, chunk_overlap=4, use_nim=False, make_summary=False))
+    assert seen["chunk_length"] == 600 and seen["chunk_overlap"] == 4

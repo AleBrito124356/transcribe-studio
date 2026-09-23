@@ -88,44 +88,77 @@ class TranscriptResult:
     duration: float
     text: str
     model_size: str = ""
+    # How speaker labels were produced ("pause-heuristic", "pyannote", ...).
+    # Empty when the segments carry no speakers.
+    diarization: str = ""
 
     def to_dict(self) -> dict:
-        return {
+        data = {
             "language": self.language,
             "duration": self.duration,
             "model_size": self.model_size,
             "text": self.text,
-            "segments": [
-                {
-                    "start": s.start,
-                    "end": s.end,
-                    "text": s.text,
-                    "speaker": s.speaker,
-                    "words": [asdict(w) for w in s.words],
-                }
-                for s in self.segments
-            ],
         }
+        if self.diarization:
+            data["diarization"] = self.diarization
+        data["segments"] = [
+            {
+                "start": s.start,
+                "end": s.end,
+                "text": s.text,
+                "speaker": s.speaker,
+                "words": [asdict(w) for w in s.words],
+            }
+            for s in self.segments
+        ]
+        return data
+
+    @property
+    def has_speakers(self) -> bool:
+        return any(s.speaker for s in self.segments)
 
     @classmethod
     def from_dict(cls, data: dict) -> "TranscriptResult":
-        segments = [
-            Segment(
-                start=float(s["start"]),
-                end=float(s["end"]),
-                text=s.get("text", ""),
-                speaker=s.get("speaker"),
-                words=[Word(**w) for w in s.get("words", [])],
+        if not isinstance(data, dict) or not isinstance(data.get("segments"), list):
+            raise InvalidTranscript(
+                "not a transcript: expected a JSON object with a 'segments' list "
+                "(the transcript.json that transcribe-studio writes)"
             )
-            for s in data.get("segments", [])
-        ]
+        try:
+            segments = [
+                Segment(
+                    start=float(s["start"]),
+                    end=float(s["end"]),
+                    text=str(s.get("text", "")),
+                    speaker=s.get("speaker"),
+                    # Tolerate extra keys (e.g. faster-whisper's "probability").
+                    words=[
+                        Word(start=float(w["start"]), end=float(w["end"]), word=str(w.get("word", "")))
+                        for w in s.get("words") or []
+                    ],
+                )
+                for s in data["segments"]
+            ]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise InvalidTranscript(f"malformed segment in transcript: {exc!r}") from None
+        text = data.get("text")
+        if not text:
+            text = " ".join(s.text.strip() for s in segments if s.text.strip())
+        duration = float(data.get("duration") or 0.0)
+        if not duration and segments:
+            duration = max(s.end for s in segments)
         return cls(
             segments=segments,
-            language=data.get("language", ""),
-            duration=float(data.get("duration", 0.0)),
-            text=data.get("text", ""),
-            model_size=data.get("model_size", ""),
+            language=data.get("language", "") or "",
+            duration=duration,
+            text=text,
+            model_size=data.get("model_size", "") or "",
+            diarization=data.get("diarization", "") or "",
         )
+
+
+class InvalidTranscript(ValueError):
+    """Raised when a JSON file is not a transcript this tool can read."""
 
 
 def save_json(result: TranscriptResult, path: str | os.PathLike) -> None:
@@ -133,8 +166,15 @@ def save_json(result: TranscriptResult, path: str | os.PathLike) -> None:
 
 
 def load_json(path: str | os.PathLike) -> TranscriptResult:
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    return TranscriptResult.from_dict(data)
+    """Load a transcript.json, raising :class:`InvalidTranscript` on bad input."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError as exc:
+        raise InvalidTranscript(f"{Path(path).name} is not valid JSON ({exc.msg} at line {exc.lineno})") from None
+    try:
+        return TranscriptResult.from_dict(data)
+    except InvalidTranscript as exc:
+        raise InvalidTranscript(f"{Path(path).name}: {exc}") from None
 
 
 # ---------------------------------------------------------------------------

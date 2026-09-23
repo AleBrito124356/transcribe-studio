@@ -5,7 +5,9 @@ Design goals:
   the functions that need it), so the pure helpers and the test-suite run anywhere.
 - Handle both audio and video: video files have their audio extracted with ffmpeg
   first, with a friendly message if ffmpeg is missing.
-- Support long files via optional chunking with timestamp offsetting.
+- Support long files via optional chunking: overlapping windows, timestamp
+  offsetting, word-level de-duplication at the overlap midpoints, and the
+  auto-detected language locked in after the first window.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from .config import (
     VIDEO_EXTENSIONS,
@@ -32,6 +34,10 @@ _FFMPEG_HINT = (
     "  - Windows:  winget install Gyan.FFmpeg   (or  choco install ffmpeg)\n"
     "Then re-run. Verify with:  ffmpeg -version"
 )
+
+
+# Default seconds shared by consecutive windows when --chunk-length is used.
+DEFAULT_CHUNK_OVERLAP = 2.0
 
 
 class FfmpegNotFound(RuntimeError):
@@ -176,6 +182,7 @@ def _run_model(
     vad_filter: bool,
     word_timestamps: bool,
     time_offset: float = 0.0,
+    on_segment: Optional[Callable[[float], None]] = None,
 ) -> Tuple[List[Segment], str]:
     """Run one decode pass and return offset segments plus detected language."""
     segments_iter, info = model.transcribe(
@@ -204,7 +211,54 @@ def _run_model(
                 words=words,
             )
         )
-    return out, getattr(info, "language", language or "")
+        if on_segment is not None:
+            on_segment(out[-1].end)
+    return out, getattr(info, "language", None) or (language or "")
+
+
+def chunk_cut_points(bounds: List[Tuple[float, float]]) -> List[float]:
+    """Where ownership passes from one chunk to the next: the overlap midpoints.
+
+    Chunk ``i`` owns speech that starts in ``[cut[i-1], cut[i])``. Cutting in the
+    middle of the overlap means both neighbours heard that audio with context on
+    either side, so the words kept on each side were decoded from full audio,
+    not from a window edge that sliced a word in half.
+    """
+    return [(bounds[i + 1][0] + bounds[i][1]) / 2.0 for i in range(len(bounds) - 1)]
+
+
+def keep_between(segments: List[Segment], lo: float, hi: float) -> List[Segment]:
+    """Keep what starts inside ``[lo, hi)``, trimming segments at word level.
+
+    A segment that straddles a cut point is split using its word timestamps, so
+    the words before the cut come from one chunk and the words after it from the
+    next — nothing is lost and nothing is transcribed twice. Segments without
+    word timestamps are kept or dropped whole by their start time.
+    """
+    kept: List[Segment] = []
+    for seg in segments:
+        if not seg.words:
+            if lo <= seg.start < hi:
+                kept.append(seg)
+            continue
+        inside = [w for w in seg.words if lo <= w.start < hi]
+        if not inside:
+            continue
+        if len(inside) == len(seg.words):
+            kept.append(seg)
+            continue
+        first_is_original = inside[0] is seg.words[0]
+        last_is_original = inside[-1] is seg.words[-1]
+        kept.append(
+            Segment(
+                start=seg.start if first_is_original else inside[0].start,
+                end=seg.end if last_is_original else inside[-1].end,
+                text="".join(w.word for w in inside).strip(),
+                words=inside,
+                speaker=seg.speaker,
+            )
+        )
+    return kept
 
 
 def transcribe(
@@ -217,8 +271,9 @@ def transcribe(
     vad_filter: bool = True,
     word_timestamps: bool = True,
     chunk_length: float = 0.0,
-    chunk_overlap: float = 0.0,
+    chunk_overlap: float = DEFAULT_CHUNK_OVERLAP,
     model=None,
+    progress: Optional[Callable[[float, Optional[float]], None]] = None,
 ) -> TranscriptResult:
     """Transcribe an audio or video file into a :class:`TranscriptResult`.
 
@@ -226,31 +281,52 @@ def transcribe(
     ----------
     model_size:
         faster-whisper size: ``tiny``, ``base``, ``small``, ``medium``,
-        ``large-v3`` (or the distil-* variants).
+        ``large-v3`` (or the distil-* variants), or a local model directory.
     language:
         Force a language (e.g. ``"en"``/``"es"``) or leave ``None`` to auto-detect.
+        When auto-detecting a chunked file, the language found in the first chunk
+        is locked in for the rest, so one quiet or noisy window cannot switch
+        the transcript to another language halfway through.
     device / compute_type:
         ``"auto"``/``"cpu"``/``"cuda"`` and ``int8``/``int8_float16``/``float16``.
     chunk_length:
         When > 0 and the file is longer than one chunk, decode in ffmpeg-cut
         windows and stitch timestamps back together. Requires ffprobe.
+    chunk_overlap:
+        Seconds shared by consecutive windows. Words are de-duplicated at the
+        middle of each overlap (see :func:`keep_between`). Must be smaller than
+        ``chunk_length``.
     model:
         A preloaded ``WhisperModel`` to reuse across a batch. Loaded on demand
         otherwise.
+    progress:
+        Optional callback ``progress(seconds_done, total_seconds_or_None)``,
+        called as segments are decoded.
     """
     media_path = str(media_path)
     if not Path(media_path).exists():
         raise FileNotFoundError(f"Media file not found: {media_path}")
+    overlap = max(0.0, float(chunk_overlap or 0.0)) if chunk_length and chunk_length > 0 else 0.0
+    if chunk_length and chunk_length > 0 and overlap >= chunk_length:
+        raise ValueError(
+            f"chunk_overlap ({overlap:g}s) must be smaller than chunk_length ({chunk_length:g}s)"
+        )
 
-    owns_model = model is None
-    if owns_model:
+    if model is None:
         model = _load_model(model_size, device, compute_type)
 
     tmp_dir = tempfile.mkdtemp(prefix="transcribe_studio_")
     created_files: List[str] = []
     try:
         duration = probe_duration(media_path)
-        bounds = chunk_boundaries(duration, chunk_length) if (chunk_length and duration) else [(0.0, duration or 0.0)]
+        if chunk_length and duration:
+            bounds = chunk_boundaries(duration, chunk_length, overlap)
+        else:
+            bounds = [(0.0, duration or 0.0)]
+
+        def report(done: float) -> None:
+            if progress is not None:
+                progress(min(done, duration) if duration else done, duration)
 
         all_segments: List[Segment] = []
         detected_language = language or ""
@@ -258,39 +334,48 @@ def transcribe(
         if len(bounds) == 1 and not is_video(media_path):
             # Simplest path: hand the file straight to faster-whisper.
             segs, detected_language = _run_model(
-                model, media_path, language, beam_size, vad_filter, word_timestamps
+                model, media_path, language, beam_size, vad_filter, word_timestamps,
+                on_segment=report,
             )
             all_segments.extend(segs)
         else:
             # Video, or a chunked long file: cut audio windows with ffmpeg.
             ensure_ffmpeg()
+            chunked = len(bounds) > 1
+            cuts = chunk_cut_points(bounds)
+            chunk_language = language
             for index, (start, end) in enumerate(bounds):
                 wav = os.path.join(tmp_dir, f"chunk_{index:04d}.wav")
                 created_files.append(wav)
-                seg_duration = None if (len(bounds) == 1) else max(0.0, end - start)
                 extract_audio(
                     media_path,
                     wav,
-                    start=(start if len(bounds) > 1 else None),
-                    duration=seg_duration,
+                    start=(start if chunked else None),
+                    duration=(max(0.0, end - start) if chunked else None),
                 )
                 segs, lang = _run_model(
                     model,
                     wav,
-                    language,
+                    chunk_language,
                     beam_size,
                     vad_filter,
                     word_timestamps,
-                    time_offset=(start if len(bounds) > 1 else 0.0),
+                    time_offset=(start if chunked else 0.0),
+                    on_segment=report,
                 )
                 if index == 0:
                     detected_language = lang
-                # Drop segments that fall entirely inside the overlap of the
-                # previous chunk to avoid duplicated lines.
-                if index > 0 and chunk_overlap > 0:
-                    cutoff = start + chunk_overlap * 0.5
-                    segs = [s for s in segs if s.start >= cutoff]
+                    if chunk_language is None and lang:
+                        chunk_language = lang  # lock auto-detected language for later chunks
+                if chunked:
+                    lo = cuts[index - 1] if index > 0 else float("-inf")
+                    hi = cuts[index] if index < len(cuts) else float("inf")
+                    segs = keep_between(segs, lo, hi)
                 all_segments.extend(segs)
+                try:
+                    os.remove(wav)  # free disk space as we go on long files
+                except OSError:
+                    pass
 
         all_segments.sort(key=lambda s: s.start)
         full_text = " ".join(s.text for s in all_segments if s.text).strip()

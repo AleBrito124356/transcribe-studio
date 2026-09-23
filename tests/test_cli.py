@@ -120,3 +120,10 @@ def test_version_flag(capsys):
         cli.main(["--version"])
     assert info.value.code == 0
     assert __version__ in capsys.readouterr().out
+
+
+def test_chunk_overlap_must_be_smaller_than_chunk_length(tmp_path, no_nim_env, capsys):
+    with pytest.raises(SystemExit) as info:
+        cli.main(["transcribe", "x.wav", "--chunk-length", "10", "--chunk-overlap", "10"])
+    assert info.value.code == 2
+    assert "--chunk-overlap" in capsys.readouterr().err

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from . import __version__
@@ -24,8 +25,9 @@ from . import summarize as summarize_mod
 from .config import load_env, load_json, save_json
 from .diarize import PYANNOTE_NOTE, assign_speakers, to_dialogue
 from .nim import MissingApiKey, NimClient, NimError
-from .pipeline import PipelineOptions, run, run_batch
+from .pipeline import DIARIZATION_HEURISTIC, PipelineOptions, is_up_to_date, run, run_batch
 from .transcribe import (
+    DEFAULT_CHUNK_OVERLAP,
     FfmpegNotFound,
     MediaDecodeError,
     WhisperUnavailable,
@@ -53,12 +55,75 @@ def _nim_client(model: str | None = None) -> NimClient:
     return NimClient.from_env(model=model, on_retry=_print_retry)
 
 
+def _clock(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def _progress_printer():
+    """A progress callback that redraws one stderr line, or None when not a TTY.
+
+    Long files can take many minutes on CPU; without this the CLI looks hung.
+    Nothing is printed when stderr is redirected, so logs stay clean.
+    """
+    stream = sys.stderr
+    if not getattr(stream, "isatty", lambda: False)():
+        return None
+    state = {"last": -1.0}
+
+    def show(done: float, total) -> None:
+        if done < state["last"]:
+            state["last"] = -1.0  # a new file started (batch mode)
+        if done - state["last"] < 1.0 and (total is None or done < total):
+            return  # at most one redraw per second of audio
+        state["last"] = done
+        if total:
+            pct = min(100, int(done * 100 / total))
+            text = f"  transcribing {_clock(done)} / {_clock(total)} ({pct}%)"
+        else:
+            text = f"  transcribing {_clock(done)}"
+        stream.write("\r" + text.ljust(48))
+        if total and done >= total:
+            stream.write("\n")
+        stream.flush()
+
+    return show
+
+
+def _transcribe_kwargs(args) -> dict:
+    return {
+        "model_size": args.model,
+        "language": args.lang,
+        "device": args.device,
+        "compute_type": args.compute_type,
+        "chunk_length": args.chunk_length,
+        "chunk_overlap": args.chunk_overlap,
+        "progress": _progress_printer(),
+    }
+
+
+def _print_batch_result(index: int, total: int, result) -> None:
+    name = Path(result.source).name
+    if result.skipped:
+        status = "up to date, skipped"
+    elif result.ok:
+        status = f"ok, {len(result.outputs)} files in {result.output_dir}"
+    else:
+        status = f"FAILED: {result.error}"
+    print(f"[{index}/{total}] {name}: {status}", flush=True)
+
+
 def _add_common_transcribe_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--lang", default=None, help="Force language code (e.g. en, es). Default: auto-detect.")
     p.add_argument("--model", default="base", help="Whisper size: tiny|base|small|medium|large-v3 (default: base).")
     p.add_argument("--device", default="auto", help="auto|cpu|cuda (default: auto).")
     p.add_argument("--compute-type", default="int8", help="int8|int8_float16|float16 (default: int8).")
     p.add_argument("--chunk-length", type=float, default=0.0, help="Chunk seconds for very long files (0 = off).")
+    p.add_argument("--chunk-overlap", type=float, default=DEFAULT_CHUNK_OVERLAP,
+                   help="Seconds shared by consecutive chunks; words are de-duplicated at the "
+                        f"middle of each overlap (default: {DEFAULT_CHUNK_OVERLAP:g}).")
 
 
 def _require_nim(model: str | None):
@@ -77,9 +142,7 @@ def _load_segments_for_summary(source: str, args):
     if path.suffix.lower() == ".json":
         tr = load_json(path)
         return tr.text, tr.language
-    tr = transcribe(source, model_size=args.model, language=args.lang,
-                    device=args.device, compute_type=args.compute_type,
-                    chunk_length=args.chunk_length)
+    tr = transcribe(source, **_transcribe_kwargs(args))
     return tr.text, tr.language
 
 
@@ -87,9 +150,7 @@ def _load_segments_for_chapters(source: str, args):
     path = Path(source)
     if path.suffix.lower() == ".json":
         return load_json(path).segments
-    tr = transcribe(source, model_size=args.model, language=args.lang,
-                    device=args.device, compute_type=args.compute_type,
-                    chunk_length=args.chunk_length)
+    tr = transcribe(source, **_transcribe_kwargs(args))
     return tr.segments
 
 
@@ -97,20 +158,14 @@ def _load_segments_for_chapters(source: str, args):
 # Command handlers
 # ---------------------------------------------------------------------------
 def cmd_transcribe(args) -> int:
-    tr = transcribe(
-        args.media,
-        model_size=args.model,
-        language=args.lang,
-        device=args.device,
-        compute_type=args.compute_type,
-        chunk_length=args.chunk_length,
-    )
+    tr = transcribe(args.media, **_transcribe_kwargs(args))
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.diarize:
         labelled = assign_speakers(tr.segments)
         body = PYANNOTE_NOTE + "\n\n" + to_dialogue(labelled)
+        tr = replace(tr, segments=labelled, diarization=DIARIZATION_HEURISTIC)
     else:
         body = segments_to_paragraphs(tr.segments)
     (out_dir / "transcript.txt").write_text(body.strip() + "\n", encoding="utf-8")
@@ -123,14 +178,7 @@ def cmd_transcribe(args) -> int:
 
 
 def cmd_subs(args) -> int:
-    tr = transcribe(
-        args.media,
-        model_size=args.model,
-        language=args.lang,
-        device=args.device,
-        compute_type=args.compute_type,
-        chunk_length=args.chunk_length,
-    )
+    tr = transcribe(args.media, **_transcribe_kwargs(args))
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     subs_mod.write_srt(tr.segments, out_dir / "captions.srt", max_chars=args.max_chars)
@@ -189,6 +237,7 @@ def cmd_all(args) -> int:
         device=args.device,
         compute_type=args.compute_type,
         chunk_length=args.chunk_length,
+        chunk_overlap=args.chunk_overlap,
         translate=args.translate,
         diarize=args.diarize,
         summary_language=args.summary_lang,
@@ -200,12 +249,19 @@ def cmd_all(args) -> int:
     client = _nim_client() if (options.use_nim and NimClient.available()) else None
     source = Path(args.source)
     if source.is_dir():
-        results = run_batch(str(source), args.out, options, nim_client=client)
+        results = run_batch(
+            str(source), args.out, options, nim_client=client,
+            skip_existing=args.skip_existing, progress=_progress_printer(),
+            on_result=_print_batch_result,
+        )
         ok = sum(1 for r in results if r.ok)
         print(f"Batch complete: {ok}/{len(results)} succeeded. Report in {Path(args.out) / 'batch_report.md'}")
-        return 0 if ok == len(results) else 1
+        return EXIT_OK if ok == len(results) else EXIT_PARTIAL
 
-    result = run(str(source), args.out, options, nim_client=client)
+    if args.skip_existing and is_up_to_date(str(source), args.out):
+        print(f"Up to date, skipped: {args.out} already holds a finished run of {source.name}.")
+        return EXIT_OK
+    result = run(str(source), args.out, options, nim_client=client, progress=_progress_printer())
     for w in result.warnings:
         print(f"note: {w}", file=sys.stderr)
     print(f"Language: {result.language}  |  Duration: {result.duration:.1f}s")
@@ -271,6 +327,9 @@ def build_parser(prog: str = "transcribe-studio") -> argparse.ArgumentParser:
     p_a.add_argument("--summary-lang", default="auto")
     p_a.add_argument("--diarize", action="store_true", help="Add approximate speaker labels.")
     p_a.add_argument("--no-nim", action="store_true", help="Skip all NIM features (offline only).")
+    p_a.add_argument("--skip-existing", action="store_true",
+                     help="Skip inputs whose output folder already holds a finished run "
+                          "(manifest.json with the same file name and size). Use it to resume a batch.")
     p_a.add_argument("--max-chars", type=int, default=subs_mod.DEFAULT_MAX_CHARS)
     _add_common_transcribe_args(p_a)
     p_a.set_defaults(func=cmd_all)
@@ -282,6 +341,9 @@ def main(argv=None, prog: str = "transcribe-studio") -> int:
     load_env()
     parser = build_parser(prog)
     args = parser.parse_args(argv)
+    if getattr(args, "chunk_length", 0) and args.chunk_length > 0:
+        if not 0 <= args.chunk_overlap < args.chunk_length:
+            parser.error("--chunk-overlap must be at least 0 and smaller than --chunk-length")
     try:
         return args.func(args)
     except KeyboardInterrupt:  # pragma: no cover
