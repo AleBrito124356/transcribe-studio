@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from src.summarize import (
+from transcribe_studio.summarize import (
     DEFAULT_MAX_CHUNK_CHARS,
     chunk_text,
     resolve_language,

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from src.config import Segment
-from src.diarize import assign_speakers, to_dialogue
+from transcribe_studio.config import Segment
+from transcribe_studio.diarize import assign_speakers, to_dialogue
 
 
 def test_assign_speakers_switches_on_gap():

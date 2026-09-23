@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from src.config import Segment
-from src.transcribe import chunk_boundaries, is_video, segments_to_paragraphs
+from transcribe_studio.config import Segment
+from transcribe_studio.transcribe import chunk_boundaries, is_video, segments_to_paragraphs
 
 
 def test_no_chunking_when_disabled():

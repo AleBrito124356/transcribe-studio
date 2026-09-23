@@ -7,10 +7,10 @@ from pathlib import Path
 
 import pytest
 
-from src import pipeline as pipeline_mod
-from src import transcribe as transcribe_mod
-from src.config import Segment, TranscriptResult
-from src.pipeline import PipelineOptions, run, run_batch
+from transcribe_studio import pipeline as pipeline_mod
+from transcribe_studio import transcribe as transcribe_mod
+from transcribe_studio.config import Segment, TranscriptResult
+from transcribe_studio.pipeline import PipelineOptions, run, run_batch
 
 
 def _fake_transcript():
