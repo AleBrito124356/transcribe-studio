@@ -81,7 +81,7 @@ def test_run_produces_all_artifacts(tmp_path):
     assert len(data["segments"]) == 3
 
 
-def test_run_without_nim_skips_summary_but_keeps_local(tmp_path, monkeypatch):
+def test_run_without_nim_writes_offline_summary_and_keeps_local(tmp_path, monkeypatch):
     monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
     out = tmp_path / "out"
     result = run(
@@ -89,8 +89,10 @@ def test_run_without_nim_skips_summary_but_keeps_local(tmp_path, monkeypatch):
         str(out),
         PipelineOptions(make_summary=True, make_chapters=True, use_nim=True),
     )
-    # No key -> no summary, but transcript/subs/chapters still land.
-    assert not (out / "summary.md").exists()
+    # No key -> an offline extractive summary (labelled as such) plus every local artifact.
+    summary = (out / "summary.md").read_text(encoding="utf-8")
+    assert "Offline extractive summary" in summary
+    assert "## TL;DR" in summary
     assert (out / "transcript.txt").exists()
     assert (out / "captions.srt").exists()
     assert (out / "chapters.md").exists()  # offline heuristic
@@ -344,3 +346,34 @@ def test_caption_report_is_returned_and_in_the_batch_report(tmp_path, monkeypatc
     monkeypatch.setattr(transcribe_mod, "_load_model", lambda *a, **k: object())
     run_batch(str(media_dir), str(tmp_path / "out"), PipelineOptions(use_nim=False))
     assert "- captions: 3 cues | 0 overlaps" in (tmp_path / "out" / "batch_report.md").read_text(encoding="utf-8")
+
+
+def test_nim_summary_failure_falls_back_to_extractive(tmp_path):
+    out = tmp_path / "out"
+    result = run("fake_media.mp3", str(out), PipelineOptions(make_chapters=True), nim_client=FailingNim())
+    summary = (out / "summary.md").read_text(encoding="utf-8")
+    assert "Offline extractive summary" in summary
+    assert any("NIM summary failed" in w for w in result.warnings)
+    assert any("offline extractive summary instead" in w for w in result.warnings)
+    assert (out / "chapters.md").exists()
+
+
+def test_offline_summary_can_be_disabled(tmp_path):
+    out = tmp_path / "out"
+    result = run("fake_media.mp3", str(out), PipelineOptions(use_nim=False, offline_summary=False))
+    assert not (out / "summary.md").exists()
+    assert any("Skipped summary.md" in w for w in result.warnings)
+
+
+def test_nim_summary_sees_speaker_turns(tmp_path):
+    seen = []
+
+    class RecordingNim(RoutingNim):
+        def chat(self, messages, **kwargs):
+            seen.append(messages[-1]["content"])
+            return super().chat(messages, **kwargs)
+
+    run("fake_media.mp3", str(tmp_path / "o"),
+        PipelineOptions(diarize=True, diarize_gap=0.3, make_chapters=False), nim_client=RecordingNim())
+    assert seen and seen[0].startswith("Speaker 1: Welcome")
+    assert "Speaker 2: Then we move on" in seen[0]

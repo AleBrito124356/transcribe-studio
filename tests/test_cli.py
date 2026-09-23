@@ -127,3 +127,24 @@ def test_chunk_overlap_must_be_smaller_than_chunk_length(tmp_path, no_nim_env, c
         cli.main(["transcribe", "x.wav", "--chunk-length", "10", "--chunk-overlap", "10"])
     assert info.value.code == 2
     assert "--chunk-overlap" in capsys.readouterr().err
+
+
+def test_summarize_local_writes_a_labelled_extractive_summary(tmp_path, no_nim_env, capsys):
+    talk = tmp_path / "talk.txt"
+    talk.write_text("Backups fail silently. We need to test a restore every month. "
+                    "Snapshots are not backups. Hay que regar temprano.", encoding="utf-8")
+    code = cli.main(["summarize", str(talk), "--local", "-o", str(tmp_path / "o")])
+    assert code == 0
+    md = (tmp_path / "o" / "summary.md").read_text(encoding="utf-8")
+    assert "Offline extractive summary" in md
+    assert "- [ ] We need to test a restore every month." in md
+    assert "- [ ] Hay que regar temprano." in md
+    assert "note:" not in capsys.readouterr().err  # explicit --local: no nagging
+
+
+def test_summarize_without_a_key_goes_offline_with_a_note(tmp_path, no_nim_env, capsys):
+    talk = tmp_path / "talk.txt"
+    talk.write_text("One sentence about backups. Another one about restores.", encoding="utf-8")
+    assert cli.main(["summarize", str(talk), "-o", str(tmp_path / "o")]) == 0
+    assert "NVIDIA_API_KEY not set" in capsys.readouterr().err
+    assert (tmp_path / "o" / "summary.md").exists()

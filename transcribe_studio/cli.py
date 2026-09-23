@@ -4,7 +4,7 @@
 Subcommands:
     transcribe   media -> transcript.txt (+ transcript.json)
     subs         media -> captions.srt / captions.vtt (+ optional translation)
-    summarize    media or transcript -> summary.md   (needs NIM)
+    summarize    media, .txt or transcript.json -> summary.md (NIM, or offline extractive)
     chapters     media or transcript.json -> chapters.md
     all          full pipeline; pass a directory for batch mode
 
@@ -20,6 +20,7 @@ from pathlib import Path
 
 from . import __version__
 from . import chapters as chapters_mod
+from . import extractive as extractive_mod
 from . import subtitles as subs_mod
 from . import summarize as summarize_mod
 from .config import load_env, load_json, save_json
@@ -207,10 +208,21 @@ def cmd_subs(args) -> int:
 
 
 def cmd_summarize(args) -> int:
-    client = _require_nim(args.model_nim)
+    offline = args.local or not NimClient.available()
+    if offline and not args.local:
+        print("note: NVIDIA_API_KEY not set; writing an offline extractive summary "
+              "(use --local to choose this explicitly).", file=sys.stderr)
     text, language = _load_segments_for_summary(args.source, args)
-    lang_phrase = summarize_mod.resolve_language(args.summary_lang, language)
-    summary = summarize_mod.summarize_transcript(text, client, language=lang_phrase)
+    if offline:
+        summary = extractive_mod.summarize_extractive(text)
+    else:
+        client = _require_nim(args.model_nim)
+        lang_phrase = summarize_mod.resolve_language(args.summary_lang, language)
+        try:
+            summary = summarize_mod.summarize_transcript(text, client, language=lang_phrase)
+        except NimError as exc:
+            raise NimError(f"{exc} Use --local for an offline extractive summary.",
+                           status=exc.status, fatal=exc.fatal) from None
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_file = out_dir / "summary.md"
@@ -316,10 +328,13 @@ def build_parser(prog: str = "transcribe-studio") -> argparse.ArgumentParser:
     p_s.set_defaults(func=cmd_subs)
 
     # summarize
-    p_sum = sub.add_parser("summarize", help="Summarize media, a .txt, or a .json transcript.")
+    p_sum = sub.add_parser("summarize", help="Summarize media, a .txt, or a .json transcript (NIM or offline).")
     p_sum.add_argument("source")
     p_sum.add_argument("-o", "--out", default="results")
     p_sum.add_argument("--summary-lang", default="auto", help="Summary language: auto|en|es|... (default: auto).")
+    p_sum.add_argument("--local", action="store_true",
+                       help="Offline extractive summary (quoted key sentences, no NIM). "
+                            "Used automatically when NVIDIA_API_KEY is not set.")
     p_sum.add_argument("--model-nim", default=None, help="Override NIM model.")
     _add_common_transcribe_args(p_sum)
     p_sum.set_defaults(func=cmd_summarize)

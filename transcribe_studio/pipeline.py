@@ -6,7 +6,8 @@ file never sinks the whole run.
 
 NIM is strictly optional. When it is unavailable, rate limited or rejects the
 key, the affected step is reported as a warning and every local artifact
-(transcript, subtitles, offline chapters) is still written.
+(transcript, subtitles, offline chapters, offline extractive summary) is still
+written.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from typing import Callable, Dict, List, Optional
 from . import __version__
 from . import chapters as chapters_mod
 from . import diarize as diarize_mod
+from . import extractive as extractive_mod
 from . import subtitles as subs_mod
 from . import summarize as summarize_mod
 from .config import MEDIA_EXTENSIONS, TranscriptResult, save_json
@@ -57,6 +59,9 @@ class PipelineOptions:
     # Tag captions with speakers ([Speaker 1] in SRT, <v Speaker 1> in VTT).
     # Uses the transcript's speakers, or the pause heuristic when it has none.
     speaker_labels: bool = False
+    # Without NIM (no key, --no-nim, or a NIM failure) write an offline
+    # extractive summary.md instead of skipping it.
+    offline_summary: bool = True
 
 
 @dataclass
@@ -85,8 +90,9 @@ def _maybe_nim(options: PipelineOptions, warnings: List[str]) -> Optional[NimCli
         return None
     if not NimClient.available():
         warnings.append(
-            "NVIDIA_API_KEY not set — skipping summary/translation and using the "
-            "offline chapter heuristic. Get a free key at build.nvidia.com."
+            "NVIDIA_API_KEY not set — summary.md is an offline extractive summary, chapters "
+            "use the offline heuristic and translation is skipped. Get a free key at "
+            "build.nvidia.com."
         )
         return None
     try:
@@ -199,27 +205,30 @@ def run(
                     subs_mod.write_captions(translated, t_srt, t_vtt, **caption_kwargs)
                     result.outputs.extend([str(t_srt), str(t_vtt)])
 
-    # 4. Summary (needs NIM).
+    # 4. Summary: NIM when available, otherwise (or if NIM fails) an offline
+    #    extractive summary, clearly labelled as such inside summary.md.
     if options.make_summary:
-        if nim_client is None:
-            result.warnings.append("Skipped summary.md: NIM is not available.")
-        else:
+        summary = None
+        if nim_client is not None:
             language = summarize_mod.resolve_language(
                 options.summary_language, transcript.language
             )
+            # With speakers, the model sees who said what.
+            text = diarize_mod.to_dialogue(segments) if transcript.has_speakers else transcript.text
             try:
-                summary = summarize_mod.summarize_transcript(
-                    transcript.text, nim_client, language=language
-                )
+                summary = summarize_mod.summarize_transcript(text, nim_client, language=language)
             except NimError as exc:
                 _record_nim_failure(result, "summary", exc)
+                result.warnings.append("summary.md is an offline extractive summary instead.")
                 nim_client = None
-            else:
-                summary_file = out_path / "summary.md"
-                summary_file.write_text(
-                    summarize_mod.to_markdown(summary), encoding="utf-8"
-                )
-                result.outputs.append(str(summary_file))
+        if summary is None and options.offline_summary:
+            summary = extractive_mod.summarize_extractive(transcript.text)
+        if summary is None:
+            result.warnings.append("Skipped summary.md: NIM is not available.")
+        else:
+            summary_file = out_path / "summary.md"
+            summary_file.write_text(summarize_mod.to_markdown(summary), encoding="utf-8")
+            result.outputs.append(str(summary_file))
 
     # 5. Chapters (NIM when available, else offline heuristic — never fails).
     if options.make_chapters:

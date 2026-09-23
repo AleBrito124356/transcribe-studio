@@ -4,6 +4,10 @@ Long transcripts are handled with a map-reduce (chunk-and-reduce) strategy: each
 chunk is summarised on its own, then the partial summaries are summarised
 together into a single result. All model calls go through the NIM client so the
 whole module is trivially mockable in tests.
+
+Without a key (or after a NIM failure) the pipeline and the ``summarize``
+command use :mod:`transcribe_studio.extractive` instead, which returns the same
+dict shape and is labelled as an offline extractive summary in ``summary.md``.
 """
 
 from __future__ import annotations
@@ -142,8 +146,17 @@ def summarize_transcript(
 
 
 def to_markdown(summary: dict, title: str = "Summary") -> str:
-    """Render a summary dict as Markdown."""
+    """Render a summary dict as Markdown.
+
+    Offline extractive summaries (``method == "extractive"``) are labelled as
+    such right under the title, so nobody mistakes quoted sentences for an
+    LLM-written summary.
+    """
     lines = [f"# {title}", ""]
+    if summary.get("method") == "extractive":
+        from .extractive import EXTRACTIVE_NOTE
+
+        lines += [EXTRACTIVE_NOTE, ""]
     if summary.get("tldr"):
         lines += ["## TL;DR", "", summary["tldr"], ""]
     if summary.get("summary"):
