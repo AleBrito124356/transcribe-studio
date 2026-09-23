@@ -6,8 +6,8 @@ import re
 
 import pytest
 
-from src.config import Segment, format_srt_timestamp, format_vtt_timestamp
-from src.subtitles import (
+from transcribe_studio.config import Segment, format_srt_timestamp, format_vtt_timestamp
+from transcribe_studio.subtitles import (
     build_cues,
     to_srt,
     to_vtt,

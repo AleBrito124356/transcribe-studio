@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from src.chapters import (
+from transcribe_studio.chapters import (
     chapters_to_markdown,
     detect_chapters,
     detect_chapters_local,
     parse_chapter_lines,
 )
-from src.config import Segment, format_chapter_timestamp, parse_timestamp
+from transcribe_studio.config import Segment, format_chapter_timestamp, parse_timestamp
 
 
 def test_chapter_timestamp_youtube_style():
@@ -86,7 +86,7 @@ def test_detect_chapters_falls_back_on_nim_error(make_segments, fake_nim):
 
 
 def test_chapters_to_markdown():
-    from src.chapters import Chapter
+    from transcribe_studio.chapters import Chapter
 
     md = chapters_to_markdown([Chapter(0.0, "Intro"), Chapter(90.0, "Details")])
     assert "# Chapters" in md

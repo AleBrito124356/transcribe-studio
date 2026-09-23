@@ -1,0 +1,433 @@
+#!/usr/bin/env python3
+"""transcribe-studio command-line interface.
+
+Subcommands (every one except `transcribe` also accepts a saved transcript.json,
+which skips Whisper entirely):
+    transcribe   media -> transcript.txt (+ transcript.json)
+    subs         media -> captions.srt / captions.vtt (+ optional translation)
+    summarize    media, .txt or transcript.json -> summary.md (NIM, or offline extractive)
+    chapters     media or transcript.json -> chapters.md
+    all          full pipeline; pass a directory for batch mode
+
+Run `python cli.py <command> -h` for per-command options.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from dataclasses import replace
+from pathlib import Path
+
+from . import __version__
+from . import chapters as chapters_mod
+from . import extractive as extractive_mod
+from . import subtitles as subs_mod
+from . import summarize as summarize_mod
+from .config import InvalidTranscript, load_env, load_json, save_json
+from .diarize import PYANNOTE_NOTE, assign_speakers, to_dialogue
+from .nim import MissingApiKey, NimClient, NimError
+from .pipeline import DIARIZATION_HEURISTIC, PipelineOptions, is_up_to_date, run, run_batch
+from .transcribe import (
+    DEFAULT_CHUNK_OVERLAP,
+    FfmpegNotFound,
+    MediaDecodeError,
+    WhisperUnavailable,
+    segments_to_paragraphs,
+    transcribe,
+)
+
+# Exit codes (also documented in the README).
+EXIT_OK = 0
+EXIT_PARTIAL = 1       # batch finished but some files failed; or an unexpected error
+EXIT_NO_KEY = 2        # a NIM-only feature was requested without NVIDIA_API_KEY
+EXIT_NO_FFMPEG = 3
+EXIT_NOT_FOUND = 4
+EXIT_NIM = 5           # NIM rejected the key, rate limited us, or was unreachable
+EXIT_WHISPER = 6       # faster-whisper missing, or the model could not be loaded
+EXIT_MEDIA = 7         # ffmpeg could not decode the input
+EXIT_BAD_INPUT = 8     # a .json that is not a transcript this tool can read
+EXIT_USAGE = 2         # an input the command cannot use (same code argparse uses)
+EXIT_INTERRUPTED = 130
+
+
+def _print_retry(attempt: int, delay: float, reason: str) -> None:
+    print(f"note: NIM {reason}; retrying in {delay:.1f}s (retry {attempt})", file=sys.stderr)
+
+
+def _nim_client(model: str | None = None) -> NimClient:
+    return NimClient.from_env(model=model, on_retry=_print_retry)
+
+
+def _clock(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def _progress_printer():
+    """A progress callback that redraws one stderr line, or None when not a TTY.
+
+    Long files can take many minutes on CPU; without this the CLI looks hung.
+    Nothing is printed when stderr is redirected, so logs stay clean.
+    """
+    stream = sys.stderr
+    if not getattr(stream, "isatty", lambda: False)():
+        return None
+    state = {"last": -1.0}
+
+    def show(done: float, total) -> None:
+        if done < state["last"]:
+            state["last"] = -1.0  # a new file started (batch mode)
+        if done - state["last"] < 1.0 and (total is None or done < total):
+            return  # at most one redraw per second of audio
+        state["last"] = done
+        if total:
+            pct = min(100, int(done * 100 / total))
+            text = f"  transcribing {_clock(done)} / {_clock(total)} ({pct}%)"
+        else:
+            text = f"  transcribing {_clock(done)}"
+        stream.write("\r" + text.ljust(48))
+        if total and done >= total:
+            stream.write("\n")
+        stream.flush()
+
+    return show
+
+
+def _transcribe_kwargs(args) -> dict:
+    return {
+        "model_size": args.model,
+        "language": args.lang,
+        "device": args.device,
+        "compute_type": args.compute_type,
+        "chunk_length": args.chunk_length,
+        "chunk_overlap": args.chunk_overlap,
+        "progress": _progress_printer(),
+    }
+
+
+def _print_batch_result(index: int, total: int, result) -> None:
+    name = Path(result.source).name
+    if result.skipped:
+        status = "up to date, skipped"
+    elif result.ok:
+        status = f"ok, {len(result.outputs)} files in {result.output_dir}"
+    else:
+        status = f"FAILED: {result.error}"
+    print(f"[{index}/{total}] {name}: {status}", flush=True)
+
+
+def _add_common_transcribe_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--lang", default=None, help="Force language code (e.g. en, es). Default: auto-detect.")
+    p.add_argument("--model", default="base", help="Whisper size: tiny|base|small|medium|large-v3 (default: base).")
+    p.add_argument("--device", default="auto", help="auto|cpu|cuda (default: auto).")
+    p.add_argument("--compute-type", default="int8", help="int8|int8_float16|float16 (default: int8).")
+    p.add_argument("--chunk-length", type=float, default=0.0, help="Chunk seconds for very long files (0 = off).")
+    p.add_argument("--chunk-overlap", type=float, default=DEFAULT_CHUNK_OVERLAP,
+                   help="Seconds shared by consecutive chunks; words are de-duplicated at the "
+                        f"middle of each overlap (default: {DEFAULT_CHUNK_OVERLAP:g}).")
+
+
+def _require_nim(model: str | None):
+    try:
+        return _nim_client(model)
+    except MissingApiKey as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(EXIT_NO_KEY)
+
+
+class UsageError(Exception):
+    """A command was given an input it cannot work with."""
+
+
+def _is_transcript(source: str) -> bool:
+    return Path(source).suffix.lower() == ".json"
+
+
+def _load_transcript(source: str, args):
+    """A saved transcript.json (no Whisper, no model download) or media (transcribed now)."""
+    if _is_transcript(source):
+        path = Path(source)
+        if not path.is_file():
+            raise FileNotFoundError(f"Transcript not found: {source}")
+        return load_json(path)
+    return transcribe(source, **_transcribe_kwargs(args))
+
+
+# ---------------------------------------------------------------------------
+# Command handlers
+# ---------------------------------------------------------------------------
+def cmd_transcribe(args) -> int:
+    if _is_transcript(args.media):
+        raise UsageError(
+            f"transcribe needs audio or video; {Path(args.media).name} is already a transcript. "
+            "Give it to subs, summarize, chapters or all instead."
+        )
+    tr = transcribe(args.media, **_transcribe_kwargs(args))
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.diarize:
+        labelled = assign_speakers(tr.segments)
+        body = PYANNOTE_NOTE + "\n\n" + to_dialogue(labelled)
+        tr = replace(tr, segments=labelled, diarization=DIARIZATION_HEURISTIC)
+    else:
+        body = segments_to_paragraphs(tr.segments)
+    (out_dir / "transcript.txt").write_text(body.strip() + "\n", encoding="utf-8")
+    save_json(tr, out_dir / "transcript.json")
+
+    print(f"Language: {tr.language}  |  Duration: {tr.duration:.1f}s  |  Segments: {len(tr.segments)}")
+    print(f"Wrote {out_dir / 'transcript.txt'}")
+    print(f"Wrote {out_dir / 'transcript.json'}")
+    return 0
+
+
+def cmd_subs(args) -> int:
+    tr = _load_transcript(args.media, args)
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    segments = tr.segments
+    if args.speaker_labels and not tr.has_speakers:
+        print("note: the transcript has no speakers; using the pause heuristic for labels.",
+              file=sys.stderr)
+        segments = assign_speakers(segments)
+    caption_kwargs = {"max_chars": args.max_chars, "speaker_labels": args.speaker_labels}
+    report = subs_mod.write_captions(segments, out_dir / "captions.srt", out_dir / "captions.vtt",
+                                     **caption_kwargs)
+    print(f"Wrote {out_dir / 'captions.srt'}")
+    print(f"Wrote {out_dir / 'captions.vtt'}")
+    print(f"Captions: {report.summary()}")
+
+    if args.translate:
+        client = _require_nim(args.model_nim)
+        translated = subs_mod.translate_segments(segments, args.translate, client)
+        t_srt = out_dir / f"captions.{args.translate}.srt"
+        t_vtt = out_dir / f"captions.{args.translate}.vtt"
+        subs_mod.write_captions(translated, t_srt, t_vtt, **caption_kwargs)
+        print(f"Wrote {t_srt}")
+        print(f"Wrote {t_vtt}")
+    return 0
+
+
+def cmd_summarize(args) -> int:
+    offline = args.local or not NimClient.available()
+    if offline and not args.local:
+        print("note: NVIDIA_API_KEY not set; writing an offline extractive summary "
+              "(use --local to choose this explicitly).", file=sys.stderr)
+    if Path(args.source).suffix.lower() == ".txt":
+        text = Path(args.source).read_text(encoding="utf-8")
+        language, nim_text = (args.lang or "auto"), text
+    else:
+        tr = _load_transcript(args.source, args)
+        text, language = tr.text, tr.language
+        nim_text = to_dialogue(tr.segments) if tr.has_speakers else text
+    if offline:
+        summary = extractive_mod.summarize_extractive(text)
+    else:
+        client = _require_nim(args.model_nim)
+        lang_phrase = summarize_mod.resolve_language(args.summary_lang, language)
+        try:
+            summary = summarize_mod.summarize_transcript(nim_text, client, language=lang_phrase)
+        except NimError as exc:
+            raise NimError(f"{exc} Use --local for an offline extractive summary.",
+                           status=exc.status, fatal=exc.fatal) from None
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_file = out_dir / "summary.md"
+    out_file.write_text(summarize_mod.to_markdown(summary), encoding="utf-8")
+    print(summary.get("tldr", ""))
+    print(f"Wrote {out_file}")
+    return 0
+
+
+def cmd_chapters(args) -> int:
+    tr = _load_transcript(args.source, args)
+    segments, duration = tr.segments, tr.duration
+    client = None
+    if not args.local and NimClient.available():
+        client = _require_nim(args.model_nim)
+    notes: list = []
+    chapter_list = chapters_mod.detect_chapters(segments, nim_client=client, warnings=notes,
+                                                duration=duration)
+    for note in notes:
+        print(f"note: {note}", file=sys.stderr)
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_file = out_dir / "chapters.md"
+    out_file.write_text(chapters_mod.chapters_to_markdown(chapter_list), encoding="utf-8")
+    print(chapters_mod.chapters_to_text(chapter_list))
+    print(f"Wrote {out_file}")
+    return 0
+
+
+def cmd_all(args) -> int:
+    options = PipelineOptions(
+        model_size=args.model,
+        language=args.lang,
+        device=args.device,
+        compute_type=args.compute_type,
+        chunk_length=args.chunk_length,
+        chunk_overlap=args.chunk_overlap,
+        translate=args.translate,
+        diarize=args.diarize,
+        summary_language=args.summary_lang,
+        use_nim=not args.no_nim,
+        max_chars=args.max_chars,
+        speaker_labels=args.speaker_labels,
+    )
+    # Build the NIM client here (not inside the pipeline) so retries are
+    # reported on stderr while the run waits out a rate limit.
+    client = _nim_client() if (options.use_nim and NimClient.available()) else None
+    source = Path(args.source)
+    if source.suffix.lower() == ".txt":
+        raise UsageError(
+            "all needs audio/video or a transcript.json; a .txt has no timestamps for "
+            "subtitles or chapters. Use `summarize` for plain text."
+        )
+    if source.is_dir():
+        results = run_batch(
+            str(source), args.out, options, nim_client=client,
+            skip_existing=args.skip_existing, progress=_progress_printer(),
+            on_result=_print_batch_result,
+        )
+        ok = sum(1 for r in results if r.ok)
+        print(f"Batch complete: {ok}/{len(results)} succeeded. Report in {Path(args.out) / 'batch_report.md'}")
+        return EXIT_OK if ok == len(results) else EXIT_PARTIAL
+
+    if args.skip_existing and is_up_to_date(str(source), args.out):
+        print(f"Up to date, skipped: {args.out} already holds a finished run of {source.name}.")
+        return EXIT_OK
+    result = run(str(source), args.out, options, nim_client=client, progress=_progress_printer())
+    for w in result.warnings:
+        print(f"note: {w}", file=sys.stderr)
+    print(f"Language: {result.language}  |  Duration: {result.duration:.1f}s")
+    for out in result.outputs:
+        print(f"Wrote {out}")
+    if result.caption_report is not None:
+        print(f"Captions: {result.caption_report.summary()}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
+def build_parser(prog: str = "transcribe-studio") -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=prog,
+        description="Turn any audio or video into transcripts, subtitles, summaries and chapters.",
+    )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument("--debug", action="store_true",
+                        help="Show full tracebacks instead of one-line error messages.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # transcribe
+    p_t = sub.add_parser("transcribe", help="Transcribe media to transcript.txt/json.")
+    p_t.add_argument("media")
+    p_t.add_argument("-o", "--out", default="results")
+    p_t.add_argument("--diarize", action="store_true", help="Add approximate speaker labels.")
+    _add_common_transcribe_args(p_t)
+    p_t.set_defaults(func=cmd_transcribe)
+
+    # subs
+    p_s = sub.add_parser("subs", help="Generate SRT and VTT subtitles (media or transcript.json).")
+    p_s.add_argument("media", help="Media file, or a transcript.json to skip Whisper.")
+    p_s.add_argument("-o", "--out", default="results")
+    p_s.add_argument("--translate", default=None, help="Also write a translated track (e.g. --translate es).")
+    p_s.add_argument("--max-chars", type=int, default=subs_mod.DEFAULT_MAX_CHARS, help="Max characters per subtitle line.")
+    p_s.add_argument("--model-nim", default=None, help="Override NIM model for translation.")
+    p_s.add_argument("--speaker-labels", action="store_true",
+                     help="[Speaker N] at each turn in SRT and <v Speaker N> voice tags in VTT.")
+    _add_common_transcribe_args(p_s)
+    p_s.set_defaults(func=cmd_subs)
+
+    # summarize
+    p_sum = sub.add_parser("summarize", help="Summarize media, a .txt, or a .json transcript (NIM or offline).")
+    p_sum.add_argument("source", help="Media file, a transcript.json, or a plain .txt.")
+    p_sum.add_argument("-o", "--out", default="results")
+    p_sum.add_argument("--summary-lang", default="auto", help="Summary language: auto|en|es|... (default: auto).")
+    p_sum.add_argument("--local", action="store_true",
+                       help="Offline extractive summary (quoted key sentences, no NIM). "
+                            "Used automatically when NVIDIA_API_KEY is not set.")
+    p_sum.add_argument("--model-nim", default=None, help="Override NIM model.")
+    _add_common_transcribe_args(p_sum)
+    p_sum.set_defaults(func=cmd_summarize)
+
+    # chapters
+    p_c = sub.add_parser("chapters", help="Generate YouTube-style chapters.")
+    p_c.add_argument("source", help="Media file, or a transcript.json to skip Whisper.")
+    p_c.add_argument("-o", "--out", default="results")
+    p_c.add_argument("--local", action="store_true", help="Force the offline heuristic (no NIM).")
+    p_c.add_argument("--model-nim", default=None, help="Override NIM model.")
+    _add_common_transcribe_args(p_c)
+    p_c.set_defaults(func=cmd_chapters)
+
+    # all
+    p_a = sub.add_parser("all", help="Full pipeline. Pass a directory for batch mode.")
+    p_a.add_argument("source", help="Media file, a transcript.json (regenerates every artifact "
+                                    "without Whisper), or a directory of media files.")
+    p_a.add_argument("-o", "--out", default="results")
+    p_a.add_argument("--translate", default=None, help="Add a translated subtitle track (e.g. es).")
+    p_a.add_argument("--summary-lang", default="auto")
+    p_a.add_argument("--diarize", action="store_true", help="Add approximate speaker labels.")
+    p_a.add_argument("--no-nim", action="store_true", help="Skip all NIM features (offline only).")
+    p_a.add_argument("--skip-existing", action="store_true",
+                     help="Skip inputs whose output folder already holds a finished run "
+                          "(manifest.json with the same file name and size). Use it to resume a batch.")
+    p_a.add_argument("--max-chars", type=int, default=subs_mod.DEFAULT_MAX_CHARS)
+    p_a.add_argument("--speaker-labels", action="store_true",
+                     help="Tag captions with speakers (implies the pause heuristic if none are known).")
+    _add_common_transcribe_args(p_a)
+    p_a.set_defaults(func=cmd_all)
+
+    return parser
+
+
+def main(argv=None, prog: str = "transcribe-studio") -> int:
+    load_env()
+    parser = build_parser(prog)
+    args = parser.parse_args(argv)
+    if getattr(args, "chunk_length", 0) and args.chunk_length > 0:
+        if not 0 <= args.chunk_overlap < args.chunk_length:
+            parser.error("--chunk-overlap must be at least 0 and smaller than --chunk-length")
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:  # pragma: no cover
+        print("\nInterrupted.", file=sys.stderr)
+        return EXIT_INTERRUPTED
+    except Exception as exc:
+        if args.debug:
+            raise
+        code, message = _explain(exc)
+        print(message, file=sys.stderr)
+        return code
+
+
+def _explain(exc: Exception) -> tuple:
+    """Map an exception to (exit code, friendly message) — never a traceback."""
+    if isinstance(exc, FfmpegNotFound):
+        return EXIT_NO_FFMPEG, str(exc)
+    if isinstance(exc, FileNotFoundError):
+        return EXIT_NOT_FOUND, f"error: {exc}"
+    if isinstance(exc, NimError):
+        return EXIT_NIM, f"error: {exc}"
+    if isinstance(exc, MissingApiKey):
+        return EXIT_NO_KEY, str(exc)
+    if isinstance(exc, WhisperUnavailable):
+        return EXIT_WHISPER, f"error: {exc}"
+    if isinstance(exc, MediaDecodeError):
+        return EXIT_MEDIA, f"error: {exc}"
+    if isinstance(exc, InvalidTranscript):
+        return EXIT_BAD_INPUT, f"error: {exc}"
+    if isinstance(exc, UsageError):
+        return EXIT_USAGE, f"error: {exc}"
+    return EXIT_PARTIAL, (
+        f"error: unexpected {type(exc).__name__}: {exc}\n"
+        "Re-run with --debug (before the command name) to see the traceback."
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

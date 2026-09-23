@@ -21,7 +21,7 @@ PYANNOTE_NOTE = (
     "segments, not from voice characteristics. For accurate speaker diarization, "
     "install pyannote.audio (pip install pyannote.audio), accept the model terms "
     "on Hugging Face, set HUGGINGFACE_TOKEN, and call diarize_pyannote() from "
-    "src/diarize.py."
+    "transcribe_studio/diarize.py."
 )
 
 

@@ -1,33 +1,46 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "transcribe-studio"
-version = "0.1.0"
+version = "0.2.0"
 description = "Turn any audio or video into a transcript, summary, chapters and subtitles (SRT/VTT)."
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Alejandro Brito" }]
 keywords = ["whisper", "transcription", "subtitles", "srt", "vtt", "summarization", "nvidia-nim"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Environment :: Console",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Multimedia :: Video",
+]
 dependencies = ["faster-whisper>=1.0.0"]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4"]
+dev = ["pytest>=7.4", "setuptools>=77"]
 diarize = ["pyannote.audio>=3.1"]
 
 [project.scripts]
-transcribe-studio = "cli:main"
+transcribe-studio = "transcribe_studio.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/AleBrito124356/transcribe-studio"
 Repository = "https://github.com/AleBrito124356/transcribe-studio"
 
 [tool.setuptools]
-py-modules = ["cli"]
-packages = ["src"]
+# One real, namespaced package. The repo-root cli.py is only a source-checkout
+# shim and is deliberately NOT installed (it used to land in site-packages as a
+# top-level `cli` module next to an equally generic top-level `src`).
+packages = ["transcribe_studio"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+    "slow: real ffmpeg, subprocess, socket or wheel-build work (deselect with -m 'not slow')",
+]

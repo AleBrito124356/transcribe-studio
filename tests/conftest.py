@@ -7,11 +7,11 @@ import sys
 
 import pytest
 
-# Make the repo root importable (so `import src...` works) regardless of the
+# Make the repo root importable (so `import transcribe_studio` works without installing) regardless of the
 # directory pytest is invoked from.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.config import Segment, Word  # noqa: E402
+from transcribe_studio.config import Segment, Word  # noqa: E402
 
 
 class FakeNim:

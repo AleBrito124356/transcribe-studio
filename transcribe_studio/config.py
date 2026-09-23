@@ -16,9 +16,34 @@ from typing import List, Optional
 # ---------------------------------------------------------------------------
 # NVIDIA NIM convention
 # ---------------------------------------------------------------------------
-NIM_BASE_URL = os.environ.get("NIM_BASE_URL", "https://integrate.api.nvidia.com/v1")
-DEFAULT_NIM_MODEL = os.environ.get("NIM_MODEL", "meta/llama-3.3-70b-instruct")
+# These are the *defaults*. The effective values are resolved from the
+# environment each time a client is built (see nim_base_url()/nim_model()), so
+# a .env loaded after import — which is exactly what the CLI does — still wins.
+DEFAULT_NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
+DEFAULT_NIM_MODEL = "meta/llama-3.3-70b-instruct"
+NIM_BASE_URL = DEFAULT_NIM_BASE_URL  # backwards-compatible alias (a default, not the live value)
 API_KEY_ENV = "NVIDIA_API_KEY"
+
+
+def nim_base_url() -> str:
+    """The OpenAI-compatible base URL, read from ``NIM_BASE_URL`` right now."""
+    return (os.environ.get("NIM_BASE_URL") or DEFAULT_NIM_BASE_URL).strip().rstrip("/")
+
+
+def nim_model() -> str:
+    """The chat model, read from ``NIM_MODEL`` right now."""
+    return (os.environ.get("NIM_MODEL") or DEFAULT_NIM_MODEL).strip()
+
+
+def env_number(name: str, default: float) -> float:
+    """Read a number from the environment, ignoring missing or garbage values."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
 
 # Media extensions we recognise. Anything with a video container gets its audio
 # extracted with ffmpeg before transcription.
@@ -63,44 +88,77 @@ class TranscriptResult:
     duration: float
     text: str
     model_size: str = ""
+    # How speaker labels were produced ("pause-heuristic", "pyannote", ...).
+    # Empty when the segments carry no speakers.
+    diarization: str = ""
 
     def to_dict(self) -> dict:
-        return {
+        data = {
             "language": self.language,
             "duration": self.duration,
             "model_size": self.model_size,
             "text": self.text,
-            "segments": [
-                {
-                    "start": s.start,
-                    "end": s.end,
-                    "text": s.text,
-                    "speaker": s.speaker,
-                    "words": [asdict(w) for w in s.words],
-                }
-                for s in self.segments
-            ],
         }
+        if self.diarization:
+            data["diarization"] = self.diarization
+        data["segments"] = [
+            {
+                "start": s.start,
+                "end": s.end,
+                "text": s.text,
+                "speaker": s.speaker,
+                "words": [asdict(w) for w in s.words],
+            }
+            for s in self.segments
+        ]
+        return data
+
+    @property
+    def has_speakers(self) -> bool:
+        return any(s.speaker for s in self.segments)
 
     @classmethod
     def from_dict(cls, data: dict) -> "TranscriptResult":
-        segments = [
-            Segment(
-                start=float(s["start"]),
-                end=float(s["end"]),
-                text=s.get("text", ""),
-                speaker=s.get("speaker"),
-                words=[Word(**w) for w in s.get("words", [])],
+        if not isinstance(data, dict) or not isinstance(data.get("segments"), list):
+            raise InvalidTranscript(
+                "not a transcript: expected a JSON object with a 'segments' list "
+                "(the transcript.json that transcribe-studio writes)"
             )
-            for s in data.get("segments", [])
-        ]
+        try:
+            segments = [
+                Segment(
+                    start=float(s["start"]),
+                    end=float(s["end"]),
+                    text=str(s.get("text", "")),
+                    speaker=s.get("speaker"),
+                    # Tolerate extra keys (e.g. faster-whisper's "probability").
+                    words=[
+                        Word(start=float(w["start"]), end=float(w["end"]), word=str(w.get("word", "")))
+                        for w in s.get("words") or []
+                    ],
+                )
+                for s in data["segments"]
+            ]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise InvalidTranscript(f"malformed segment in transcript: {exc!r}") from None
+        text = data.get("text")
+        if not text:
+            text = " ".join(s.text.strip() for s in segments if s.text.strip())
+        duration = float(data.get("duration") or 0.0)
+        if not duration and segments:
+            duration = max(s.end for s in segments)
         return cls(
             segments=segments,
-            language=data.get("language", ""),
-            duration=float(data.get("duration", 0.0)),
-            text=data.get("text", ""),
-            model_size=data.get("model_size", ""),
+            language=data.get("language", "") or "",
+            duration=duration,
+            text=text,
+            model_size=data.get("model_size", "") or "",
+            diarization=data.get("diarization", "") or "",
         )
+
+
+class InvalidTranscript(ValueError):
+    """Raised when a JSON file is not a transcript this tool can read."""
 
 
 def save_json(result: TranscriptResult, path: str | os.PathLike) -> None:
@@ -108,8 +166,15 @@ def save_json(result: TranscriptResult, path: str | os.PathLike) -> None:
 
 
 def load_json(path: str | os.PathLike) -> TranscriptResult:
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    return TranscriptResult.from_dict(data)
+    """Load a transcript.json, raising :class:`InvalidTranscript` on bad input."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError as exc:
+        raise InvalidTranscript(f"{Path(path).name} is not valid JSON ({exc.msg} at line {exc.lineno})") from None
+    try:
+        return TranscriptResult.from_dict(data)
+    except InvalidTranscript as exc:
+        raise InvalidTranscript(f"{Path(path).name}: {exc}") from None
 
 
 # ---------------------------------------------------------------------------
