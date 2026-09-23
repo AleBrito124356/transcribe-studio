@@ -205,14 +205,22 @@ def parse_chapter_lines(text: str) -> List[Chapter]:
 def detect_chapters(
     segments: List[Segment],
     nim_client=None,
+    warnings: Optional[List[str]] = None,
     **kwargs,
 ) -> List[Chapter]:
-    """Use NIM when a client is supplied, otherwise the local heuristic."""
+    """Use NIM when a client is supplied, otherwise the local heuristic.
+
+    Any NIM failure degrades to the offline heuristic; when ``warnings`` is a
+    list, the reason is appended to it so callers can report it.
+    """
     if nim_client is not None:
         try:
             return detect_chapters_nim(segments, nim_client)
-        except Exception:
-            # Any NIM failure degrades gracefully to the offline heuristic.
+        except Exception as exc:
+            if warnings is not None:
+                warnings.append(
+                    f"NIM chapters failed ({exc}); used the offline chapter heuristic instead."
+                )
             return detect_chapters_local(segments, **kwargs)
     return detect_chapters_local(segments, **kwargs)
 

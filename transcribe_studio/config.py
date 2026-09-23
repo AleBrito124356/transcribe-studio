@@ -16,9 +16,34 @@ from typing import List, Optional
 # ---------------------------------------------------------------------------
 # NVIDIA NIM convention
 # ---------------------------------------------------------------------------
-NIM_BASE_URL = os.environ.get("NIM_BASE_URL", "https://integrate.api.nvidia.com/v1")
-DEFAULT_NIM_MODEL = os.environ.get("NIM_MODEL", "meta/llama-3.3-70b-instruct")
+# These are the *defaults*. The effective values are resolved from the
+# environment each time a client is built (see nim_base_url()/nim_model()), so
+# a .env loaded after import — which is exactly what the CLI does — still wins.
+DEFAULT_NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
+DEFAULT_NIM_MODEL = "meta/llama-3.3-70b-instruct"
+NIM_BASE_URL = DEFAULT_NIM_BASE_URL  # backwards-compatible alias (a default, not the live value)
 API_KEY_ENV = "NVIDIA_API_KEY"
+
+
+def nim_base_url() -> str:
+    """The OpenAI-compatible base URL, read from ``NIM_BASE_URL`` right now."""
+    return (os.environ.get("NIM_BASE_URL") or DEFAULT_NIM_BASE_URL).strip().rstrip("/")
+
+
+def nim_model() -> str:
+    """The chat model, read from ``NIM_MODEL`` right now."""
+    return (os.environ.get("NIM_MODEL") or DEFAULT_NIM_MODEL).strip()
+
+
+def env_number(name: str, default: float) -> float:
+    """Read a number from the environment, ignoring missing or garbage values."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
 
 # Media extensions we recognise. Anything with a video container gets its audio
 # extracted with ffmpeg before transcription.

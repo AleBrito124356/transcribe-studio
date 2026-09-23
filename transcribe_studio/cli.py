@@ -23,13 +23,34 @@ from . import subtitles as subs_mod
 from . import summarize as summarize_mod
 from .config import load_env, load_json, save_json
 from .diarize import PYANNOTE_NOTE, assign_speakers, to_dialogue
-from .nim import MissingApiKey, NimClient
+from .nim import MissingApiKey, NimClient, NimError
 from .pipeline import PipelineOptions, run, run_batch
 from .transcribe import (
     FfmpegNotFound,
+    MediaDecodeError,
+    WhisperUnavailable,
     segments_to_paragraphs,
     transcribe,
 )
+
+# Exit codes (also documented in the README).
+EXIT_OK = 0
+EXIT_PARTIAL = 1       # batch finished but some files failed; or an unexpected error
+EXIT_NO_KEY = 2        # a NIM-only feature was requested without NVIDIA_API_KEY
+EXIT_NO_FFMPEG = 3
+EXIT_NOT_FOUND = 4
+EXIT_NIM = 5           # NIM rejected the key, rate limited us, or was unreachable
+EXIT_WHISPER = 6       # faster-whisper missing, or the model could not be loaded
+EXIT_MEDIA = 7         # ffmpeg could not decode the input
+EXIT_INTERRUPTED = 130
+
+
+def _print_retry(attempt: int, delay: float, reason: str) -> None:
+    print(f"note: NIM {reason}; retrying in {delay:.1f}s (retry {attempt})", file=sys.stderr)
+
+
+def _nim_client(model: str | None = None) -> NimClient:
+    return NimClient.from_env(model=model, on_retry=_print_retry)
 
 
 def _add_common_transcribe_args(p: argparse.ArgumentParser) -> None:
@@ -42,10 +63,10 @@ def _add_common_transcribe_args(p: argparse.ArgumentParser) -> None:
 
 def _require_nim(model: str | None):
     try:
-        return NimClient.from_env(model=model)
+        return _nim_client(model)
     except MissingApiKey as exc:
         print(str(exc), file=sys.stderr)
-        raise SystemExit(2)
+        raise SystemExit(EXIT_NO_KEY)
 
 
 def _load_segments_for_summary(source: str, args):
@@ -148,7 +169,10 @@ def cmd_chapters(args) -> int:
     client = None
     if not args.local and NimClient.available():
         client = _require_nim(args.model_nim)
-    chapter_list = chapters_mod.detect_chapters(segments, nim_client=client)
+    notes: list = []
+    chapter_list = chapters_mod.detect_chapters(segments, nim_client=client, warnings=notes)
+    for note in notes:
+        print(f"note: {note}", file=sys.stderr)
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_file = out_dir / "chapters.md"
@@ -171,14 +195,17 @@ def cmd_all(args) -> int:
         use_nim=not args.no_nim,
         max_chars=args.max_chars,
     )
+    # Build the NIM client here (not inside the pipeline) so retries are
+    # reported on stderr while the run waits out a rate limit.
+    client = _nim_client() if (options.use_nim and NimClient.available()) else None
     source = Path(args.source)
     if source.is_dir():
-        results = run_batch(str(source), args.out, options)
+        results = run_batch(str(source), args.out, options, nim_client=client)
         ok = sum(1 for r in results if r.ok)
         print(f"Batch complete: {ok}/{len(results)} succeeded. Report in {Path(args.out) / 'batch_report.md'}")
         return 0 if ok == len(results) else 1
 
-    result = run(str(source), args.out, options)
+    result = run(str(source), args.out, options, nim_client=client)
     for w in result.warnings:
         print(f"note: {w}", file=sys.stderr)
     print(f"Language: {result.language}  |  Duration: {result.duration:.1f}s")
@@ -196,6 +223,8 @@ def build_parser(prog: str = "transcribe-studio") -> argparse.ArgumentParser:
         description="Turn any audio or video into transcripts, subtitles, summaries and chapters.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument("--debug", action="store_true",
+                        help="Show full tracebacks instead of one-line error messages.")
     sub = parser.add_subparsers(dest="command", required=True)
 
     # transcribe
@@ -255,15 +284,35 @@ def main(argv=None, prog: str = "transcribe-studio") -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except FfmpegNotFound as exc:
-        print(str(exc), file=sys.stderr)
-        return 3
-    except FileNotFoundError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 4
     except KeyboardInterrupt:  # pragma: no cover
         print("\nInterrupted.", file=sys.stderr)
-        return 130
+        return EXIT_INTERRUPTED
+    except Exception as exc:
+        if args.debug:
+            raise
+        code, message = _explain(exc)
+        print(message, file=sys.stderr)
+        return code
+
+
+def _explain(exc: Exception) -> tuple:
+    """Map an exception to (exit code, friendly message) — never a traceback."""
+    if isinstance(exc, FfmpegNotFound):
+        return EXIT_NO_FFMPEG, str(exc)
+    if isinstance(exc, FileNotFoundError):
+        return EXIT_NOT_FOUND, f"error: {exc}"
+    if isinstance(exc, NimError):
+        return EXIT_NIM, f"error: {exc}"
+    if isinstance(exc, MissingApiKey):
+        return EXIT_NO_KEY, str(exc)
+    if isinstance(exc, WhisperUnavailable):
+        return EXIT_WHISPER, f"error: {exc}"
+    if isinstance(exc, MediaDecodeError):
+        return EXIT_MEDIA, f"error: {exc}"
+    return EXIT_PARTIAL, (
+        f"error: unexpected {type(exc).__name__}: {exc}\n"
+        "Re-run with --debug (before the command name) to see the traceback."
+    )
 
 
 if __name__ == "__main__":

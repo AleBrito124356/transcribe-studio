@@ -155,3 +155,67 @@ def test_batch_isolates_failures(tmp_path, monkeypatch):
     assert "boom" in by_name["bad.mp3"].error
     # A report is written.
     assert (tmp_path / "out" / "batch_report.md").exists()
+
+
+class FailingNim:
+    """A NIM client whose every call fails the way the real one does."""
+
+    def __init__(self, fatal=False):
+        self.calls = 0
+        self.fatal = fatal
+
+    def chat(self, messages, **kwargs):
+        from transcribe_studio.nim import NimError
+
+        self.calls += 1
+        if self.fatal:
+            raise NimError("NIM rejected the API key (HTTP 401).", status=401, fatal=True)
+        raise NimError("Could not reach NIM at http://127.0.0.1:1/v1: connection refused (after 4 attempts).")
+
+
+def test_nim_failure_does_not_abort_the_run(tmp_path):
+    out = tmp_path / "out"
+    nim = FailingNim()
+    result = run(
+        "fake_media.mp3",
+        str(out),
+        PipelineOptions(translate="es", make_summary=True, make_chapters=True),
+        nim_client=nim,
+    )
+    assert result.ok
+    for name in ("transcript.txt", "transcript.json", "captions.srt", "captions.vtt", "chapters.md"):
+        assert (out / name).exists(), f"missing {name}"
+    assert not (out / "captions.es.srt").exists()
+    assert nim.calls == 1  # after the first failure the run stops calling NIM
+    assert result.nim_error and "connection refused" in result.nim_error
+    assert not result.nim_fatal
+    assert any("translation to 'es' failed" in w for w in result.warnings)
+    assert (out / "chapters.md").read_text(encoding="utf-8").startswith("# Chapters\n\n00:00 ")
+
+
+def test_nim_chapter_failure_falls_back_with_a_warning(tmp_path):
+    out = tmp_path / "out"
+    result = run(
+        "fake_media.mp3",
+        str(out),
+        PipelineOptions(make_summary=False, make_chapters=True),
+        nim_client=FailingNim(),
+    )
+    assert (out / "chapters.md").exists()
+    assert any("offline chapter heuristic" in w for w in result.warnings)
+
+
+def test_batch_stops_using_nim_after_a_fatal_error(tmp_path, monkeypatch):
+    media_dir = tmp_path / "media"
+    media_dir.mkdir()
+    for name in ("a.mp3", "b.mp3", "c.mp3"):
+        (media_dir / name).write_bytes(b"x")
+    monkeypatch.setattr(transcribe_mod, "_load_model", lambda *a, **k: object())
+    nim = FailingNim(fatal=True)
+    results = run_batch(str(media_dir), str(tmp_path / "out"),
+                        PipelineOptions(make_chapters=False), nim_client=nim)
+    assert [r.ok for r in results] == [True, True, True]
+    assert nim.calls == 1  # the bad key is not retried on b.mp3 and c.mp3
+    assert results[0].nim_fatal
+    assert any("NIM disabled for the rest of the batch" in w for w in results[1].warnings)
+    assert any("NIM disabled for the rest of the batch" in w for w in results[2].warnings)

@@ -3,6 +3,10 @@
 `run` processes a single file into an output folder. `run_batch` walks a
 directory, giving every file its own subfolder and isolating failures so one bad
 file never sinks the whole run.
+
+NIM is strictly optional. When it is unavailable, rate limited or rejects the
+key, the affected step is reported as a warning and every local artifact
+(transcript, subtitles, offline chapters) is still written.
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ from . import diarize as diarize_mod
 from . import subtitles as subs_mod
 from . import summarize as summarize_mod
 from .config import MEDIA_EXTENSIONS, TranscriptResult, save_json
-from .nim import MissingApiKey, NimClient
+from .nim import MissingApiKey, NimClient, NimError
 from .transcribe import segments_to_paragraphs, transcribe
 
 
@@ -53,6 +57,10 @@ class PipelineResult:
     duration: float = 0.0
     ok: bool = True
     error: Optional[str] = None
+    # Set when a NIM call failed during this run. ``nim_fatal`` means retrying
+    # will not help (bad key / unknown model), so a batch stops using NIM.
+    nim_error: Optional[str] = None
+    nim_fatal: bool = False
 
 
 def _maybe_nim(options: PipelineOptions, warnings: List[str]) -> Optional[NimClient]:
@@ -70,6 +78,13 @@ def _maybe_nim(options: PipelineOptions, warnings: List[str]) -> Optional[NimCli
     except MissingApiKey as exc:  # pragma: no cover - guarded by available()
         warnings.append(str(exc))
         return None
+
+
+def _record_nim_failure(result: PipelineResult, step: str, exc: NimError) -> None:
+    if result.nim_error is None:
+        result.nim_error = str(exc)
+    result.nim_fatal = result.nim_fatal or bool(getattr(exc, "fatal", False))
+    result.warnings.append(f"NIM {step} failed: {exc}")
 
 
 def run(
@@ -144,38 +159,50 @@ def run(
         if options.translate:
             if nim_client is None:
                 result.warnings.append(
-                    f"Skipped translation to '{options.translate}': no NIM key."
+                    f"Skipped translation to '{options.translate}': NIM is not available."
                 )
             else:
-                translated = subs_mod.translate_segments(
-                    segments, options.translate, nim_client
-                )
-                t_srt = out_path / f"captions.{options.translate}.srt"
-                t_vtt = out_path / f"captions.{options.translate}.vtt"
-                subs_mod.write_srt(translated, t_srt, max_chars=options.max_chars)
-                subs_mod.write_vtt(translated, t_vtt, max_chars=options.max_chars)
-                result.outputs.extend([str(t_srt), str(t_vtt)])
+                try:
+                    translated = subs_mod.translate_segments(
+                        segments, options.translate, nim_client
+                    )
+                except NimError as exc:
+                    _record_nim_failure(result, f"translation to '{options.translate}'", exc)
+                    nim_client = None  # do not hammer a failing endpoint for the next steps
+                else:
+                    t_srt = out_path / f"captions.{options.translate}.srt"
+                    t_vtt = out_path / f"captions.{options.translate}.vtt"
+                    subs_mod.write_srt(translated, t_srt, max_chars=options.max_chars)
+                    subs_mod.write_vtt(translated, t_vtt, max_chars=options.max_chars)
+                    result.outputs.extend([str(t_srt), str(t_vtt)])
 
     # 4. Summary (needs NIM).
     if options.make_summary:
         if nim_client is None:
-            result.warnings.append("Skipped summary.md: no NIM key.")
+            result.warnings.append("Skipped summary.md: NIM is not available.")
         else:
             language = summarize_mod.resolve_language(
                 options.summary_language, transcript.language
             )
-            summary = summarize_mod.summarize_transcript(
-                transcript.text, nim_client, language=language
-            )
-            summary_file = out_path / "summary.md"
-            summary_file.write_text(
-                summarize_mod.to_markdown(summary), encoding="utf-8"
-            )
-            result.outputs.append(str(summary_file))
+            try:
+                summary = summarize_mod.summarize_transcript(
+                    transcript.text, nim_client, language=language
+                )
+            except NimError as exc:
+                _record_nim_failure(result, "summary", exc)
+                nim_client = None
+            else:
+                summary_file = out_path / "summary.md"
+                summary_file.write_text(
+                    summarize_mod.to_markdown(summary), encoding="utf-8"
+                )
+                result.outputs.append(str(summary_file))
 
-    # 5. Chapters (NIM when available, else offline heuristic).
+    # 5. Chapters (NIM when available, else offline heuristic — never fails).
     if options.make_chapters:
-        chapter_list = chapters_mod.detect_chapters(segments, nim_client=nim_client)
+        chapter_list = chapters_mod.detect_chapters(
+            segments, nim_client=nim_client, warnings=result.warnings
+        )
         chapters_file = out_path / "chapters.md"
         chapters_file.write_text(
             chapters_mod.chapters_to_markdown(chapter_list), encoding="utf-8"
@@ -200,18 +227,23 @@ def run_batch(
     input_dir: str,
     out_dir: str,
     options: Optional[PipelineOptions] = None,
+    nim_client: Optional[NimClient] = None,
 ) -> List[PipelineResult]:
     """Process every media file in ``input_dir`` with per-file error isolation.
 
     The whisper model is loaded once and reused across files. A failure on one
-    file is recorded and the batch continues.
+    file is recorded and the batch continues. If NIM rejects the key (or the
+    model does not exist), NIM is switched off for the remaining files instead
+    of failing the same way on every one of them.
     """
     options = options or PipelineOptions()
     files = find_media_files(input_dir)
     results: List[PipelineResult] = []
 
     warnings: List[str] = []
-    nim_client = _maybe_nim(options, warnings)
+    if nim_client is None:
+        nim_client = _maybe_nim(options, warnings)
+    nim_disabled_reason: Optional[str] = None
 
     # Load the model once for the whole batch.
     model = None
@@ -222,10 +254,18 @@ def run_batch(
 
     for media in files:
         file_out = Path(out_dir) / media.stem
+        # With no batch-level client, keep run() from rebuilding one from the
+        # environment (and repeating the same "no key" warning per file).
+        file_options = options if nim_client is not None else _without_nim(options)
         try:
-            res = run(str(media), str(file_out), options, model=model, nim_client=nim_client)
-            if warnings:
-                res.warnings = warnings + res.warnings
+            res = run(str(media), str(file_out), file_options, model=model, nim_client=nim_client)
+            extra = list(warnings)
+            if nim_disabled_reason is not None:
+                extra.append(f"NIM disabled for the rest of the batch: {nim_disabled_reason}")
+            res.warnings = extra + res.warnings
+            if res.nim_fatal and nim_client is not None:
+                nim_client = None
+                nim_disabled_reason = res.nim_error
             results.append(res)
         except Exception as exc:  # isolate this file's failure
             results.append(
@@ -240,6 +280,12 @@ def run_batch(
 
     _write_batch_report(out_dir, results)
     return results
+
+
+def _without_nim(options: PipelineOptions) -> PipelineOptions:
+    from dataclasses import replace
+
+    return replace(options, use_nim=False)
 
 
 def _write_batch_report(out_dir: str, results: List[PipelineResult]) -> None:

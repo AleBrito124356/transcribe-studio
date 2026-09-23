@@ -38,6 +38,14 @@ class FfmpegNotFound(RuntimeError):
     """Raised when ffmpeg is required but not installed."""
 
 
+class MediaDecodeError(RuntimeError):
+    """Raised when ffmpeg cannot decode or extract audio from the input."""
+
+
+class WhisperUnavailable(RuntimeError):
+    """Raised when faster-whisper is missing or the model cannot be loaded."""
+
+
 def ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
@@ -97,7 +105,11 @@ def extract_audio(
     cmd += ["-vn", "-ac", "1", "-ar", str(sample_rate), "-f", "wav", str(out_wav)]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed to extract audio:\n{proc.stderr.strip()}")
+        detail = proc.stderr.strip().splitlines()
+        raise MediaDecodeError(
+            f"ffmpeg could not read audio from {Path(media_path).name}: "
+            + (detail[-1] if detail else f"exit code {proc.returncode}")
+        )
     return str(out_wav)
 
 
@@ -130,16 +142,30 @@ def chunk_boundaries(
 
 
 def _load_model(model_size: str, device: str, compute_type: str):
-    """Instantiate a faster-whisper model (imported lazily)."""
+    """Instantiate a faster-whisper model (imported lazily).
+
+    Raises :class:`WhisperUnavailable` with an actionable message when
+    faster-whisper is not installed or the model cannot be loaded (the first
+    use of a size downloads it from Hugging Face, which needs a connection).
+    """
     try:
         from faster_whisper import WhisperModel
-    except ImportError as exc:  # pragma: no cover - depends on install
-        raise ImportError(
-            "faster-whisper is not installed. Install it with:\n"
-            "    pip install faster-whisper\n"
-            "For NVIDIA GPU acceleration also install a CUDA-enabled build; see the README."
+    except ImportError as exc:
+        raise WhisperUnavailable(
+            "faster-whisper is not installed, so media cannot be transcribed. Install it "
+            "with `pip install faster-whisper` (or `pip install -r requirements.txt`). "
+            "Commands given a transcript.json do not need it."
         ) from exc
-    return WhisperModel(model_size, device=device, compute_type=compute_type)
+    try:
+        return WhisperModel(model_size, device=device, compute_type=compute_type)
+    except Exception as exc:
+        first_line = (str(exc).strip().splitlines() or [type(exc).__name__])[0]
+        raise WhisperUnavailable(
+            f"could not load the Whisper model '{model_size}' ({type(exc).__name__}: "
+            f"{first_line}). The first use of a model size downloads it from Hugging Face, "
+            "so check your connection, or pass a local model directory with --model. "
+            "On GPU errors, retry with --device cpu --compute-type int8."
+        ) from exc
 
 
 def _run_model(
