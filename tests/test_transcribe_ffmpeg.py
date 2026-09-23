@@ -188,3 +188,29 @@ def test_keep_between_without_words_uses_segment_start():
     segs = [Segment(24.0, 26.0, "a"), Segment(25.0, 27.0, "b")]
     assert [s.text for s in keep_between(segs, float("-inf"), 25.0)] == ["a"]
     assert [s.text for s in keep_between(segs, 25.0, float("inf"))] == ["b"]
+
+
+class DecodingModel(FakeWhisper):
+    """Decodes with faster-whisper's real PyAV decoder before faking the rest."""
+
+    def transcribe(self, audio_path, language=None, **kwargs):
+        from faster_whisper.audio import decode_audio
+
+        decode_audio(audio_path)
+        return super().transcribe(audio_path, language=language, **kwargs)
+
+
+def test_unreadable_audio_decoded_by_faster_whisper_is_a_media_error(tmp_path, monkeypatch, capsys):
+    pytest.importorskip("faster_whisper.audio")
+    bad = tmp_path / "broken.mp3"
+    bad.write_bytes(b"this is not an mp3")
+    with pytest.raises(MediaDecodeError, match="broken.mp3"):
+        transcribe(bad, model=DecodingModel())
+
+    from transcribe_studio import cli
+    from transcribe_studio import transcribe as transcribe_mod
+
+    monkeypatch.setattr(transcribe_mod, "_load_model", lambda *a, **k: DecodingModel())
+    assert cli.main(["transcribe", str(bad), "-o", str(tmp_path / "o")]) == cli.EXIT_MEDIA
+    err = capsys.readouterr().err
+    assert err.startswith("error: could not decode audio from broken.mp3") and "Traceback" not in err

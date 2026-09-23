@@ -185,13 +185,23 @@ def _run_model(
     on_segment: Optional[Callable[[float], None]] = None,
 ) -> Tuple[List[Segment], str]:
     """Run one decode pass and return offset segments plus detected language."""
-    segments_iter, info = model.transcribe(
-        audio_path,
-        language=language,
-        beam_size=beam_size,
-        vad_filter=vad_filter,
-        word_timestamps=word_timestamps,
-    )
+    try:
+        segments_iter, info = model.transcribe(
+            audio_path,
+            language=language,
+            beam_size=beam_size,
+            vad_filter=vad_filter,
+            word_timestamps=word_timestamps,
+        )
+    except Exception as exc:
+        # faster-whisper decodes plain audio itself with PyAV; report an
+        # unreadable file the same way as an ffmpeg extraction failure.
+        if type(exc).__module__.split(".")[0] == "av":
+            first_line = (str(exc).strip().splitlines() or [type(exc).__name__])[0]
+            raise MediaDecodeError(
+                f"could not decode audio from {Path(audio_path).name}: {first_line[:200]}"
+            ) from exc
+        raise
     out: List[Segment] = []
     for seg in segments_iter:
         words: List[Word] = []
