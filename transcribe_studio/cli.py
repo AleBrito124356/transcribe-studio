@@ -147,11 +147,13 @@ def _load_segments_for_summary(source: str, args):
 
 
 def _load_segments_for_chapters(source: str, args):
+    """Return (segments, duration) from a transcript.json or media."""
     path = Path(source)
     if path.suffix.lower() == ".json":
-        return load_json(path).segments
-    tr = transcribe(source, **_transcribe_kwargs(args))
-    return tr.segments
+        tr = load_json(path)
+    else:
+        tr = transcribe(source, **_transcribe_kwargs(args))
+    return tr.segments, tr.duration
 
 
 # ---------------------------------------------------------------------------
@@ -219,12 +221,13 @@ def cmd_summarize(args) -> int:
 
 
 def cmd_chapters(args) -> int:
-    segments = _load_segments_for_chapters(args.source, args)
+    segments, duration = _load_segments_for_chapters(args.source, args)
     client = None
     if not args.local and NimClient.available():
         client = _require_nim(args.model_nim)
     notes: list = []
-    chapter_list = chapters_mod.detect_chapters(segments, nim_client=client, warnings=notes)
+    chapter_list = chapters_mod.detect_chapters(segments, nim_client=client, warnings=notes,
+                                                duration=duration)
     for note in notes:
         print(f"note: {note}", file=sys.stderr)
     out_dir = Path(args.out)

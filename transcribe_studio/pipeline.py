@@ -224,7 +224,8 @@ def run(
     # 5. Chapters (NIM when available, else offline heuristic — never fails).
     if options.make_chapters:
         chapter_list = chapters_mod.detect_chapters(
-            segments, nim_client=nim_client, warnings=result.warnings
+            segments, nim_client=nim_client, warnings=result.warnings,
+            duration=transcript.duration,
         )
         chapters_file = out_path / "chapters.md"
         chapters_file.write_text(
